@@ -1,0 +1,2976 @@
+Set-Content -Path ModManager.cs -Value @"
+/*
+ * Motor Town Server Mod Manager
+ * Built to handle multi-server .pak versioning, smart matching, quick layout deployments, and game launch.
+ * Cleaned up and restructured to keep everything maintainable without any auto-generated fluff.
+ */
+
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Drawing;
+using System.Windows.Forms;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.VisualBasic;
+
+namespace MotorTownModManager
+{
+    public class ModManagerForm : Form
+    {
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(int dpiContext);
+        private static readonly int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        private const int EM_SETMARGINS = 0xD3;
+        private const int EC_LEFTMARGIN = 0x1;
+
+        // Fix: when ModManager.exe is run elevated ("Run as administrator") - which many
+        // users do because the default paks path is under Program Files (x86) - Windows'
+        // User Interface Privilege Isolation (UIPI) silently blocks drag-and-drop coming
+        // from a non-elevated Explorer window. No exception is thrown; the drop is just
+        // swallowed. ChangeWindowMessageFilterEx explicitly allows the messages that
+        // drag-and-drop relies on through that isolation boundary.
+        [DllImport("user32.dll")]
+        private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint message, uint action, IntPtr changeInfo);
+        private const uint MSGFLT_ALLOW = 1;
+        private const uint WM_DROPFILES = 0x0233;
+        private const uint WM_COPYDATA = 0x004A;
+        private const uint WM_COPYGLOBALDATA = 0x0049;
+        private const int WM_SETREDRAW = 0x000B;
+
+        // Applies Windows' built-in "DarkMode_Explorer" visual style to a control's native
+        // scrollbar (Explorer, File Manager, etc. all use this same mechanism for themed
+        // scrollbars) - this is what actually recolors the ListBox's scrollbar thumb/track,
+        // since there's no public WinForms property for that.
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+
+        // Lets the window's own title bar (where the minimize/maximize/X buttons live) match
+        // the app's theme. DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Windows 11 22000+) allow a
+        // fully custom color; DWMWA_USE_IMMERSIVE_DARK_MODE is the older dark/light-only
+        // fallback for Windows 10. Both are best-effort - older systems simply keep the
+        // default title bar if neither call is supported.
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        private const int DWMWA_CAPTION_COLOR = 35;
+        private const int DWMWA_TEXT_COLOR = 36;
+
+        // Fix: reading virtual "FileContents" (dragging files out of an open Zip/Explorer
+        // preview window) with no index always returns the FIRST file's bytes for every
+        // entry, so a multi-file virtual drop silently duplicates one file's content under
+        // every dropped name. These P/Invokes let us pull each file's content by its own
+        // index instead.
+        [DllImport("ole32.dll")]
+        private static extern void ReleaseStgMedium(ref System.Runtime.InteropServices.ComTypes.STGMEDIUM medium);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalLock(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        private static extern bool GlobalUnlock(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        private static extern int GlobalSize(IntPtr hMem);
+
+        // Fix: names coming from FILEDESCRIPTORW (virtual drag-drop) are attacker-influenced
+        // data, not real filesystem paths. Path.Combine will happily honor "..\..\evil.exe"
+        // or an absolute path like "C:\Windows\..." and write outside the intended folder.
+        // This strips any directory component and re-validates the final path stays inside
+        // destDir before anything is written to disk.
+        // Fix (Zip Slip): ZipFile.ExtractToDirectory on .NET Framework does not validate
+        // that entry paths stay inside the destination folder. A crafted .pak/.zip with an
+        // entry named e.g. "..\..\..\AppData\Roaming\Startup\evil.exe" would otherwise be
+        // written outside destDir. This extracts entry-by-entry and rejects any entry whose
+        // resolved path would escape destDir.
+        private static void SafeExtractZip(string zipPath, string destDir)
+        {
+            Directory.CreateDirectory(destDir);
+            string destFull = Path.GetFullPath(destDir);
+            if (!destFull.EndsWith(Path.DirectorySeparatorChar.ToString()))
+                destFull += Path.DirectorySeparatorChar;
+
+            using (ZipArchive archive = ZipFile.OpenRead(zipPath))
+            {
+                foreach (ZipArchiveEntry entry in archive.Entries)
+                {
+                    string entryName = entry.FullName.Replace('/', Path.DirectorySeparatorChar);
+
+                    if (Path.IsPathRooted(entryName) || entryName.Contains(".."))
+                    {
+                        continue; // reject suspicious entry outright
+                    }
+
+                    string targetPath = Path.GetFullPath(Path.Combine(destFull, entryName));
+                    if (!targetPath.StartsWith(destFull, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue; // resolved path still escaped destDir - extra safety net
+                    }
+
+                    if (string.IsNullOrEmpty(entry.Name))
+                    {
+                        // directory entry
+                        Directory.CreateDirectory(targetPath);
+                        continue;
+                    }
+
+                    string parentDir = Path.GetDirectoryName(targetPath);
+                    if (!string.IsNullOrEmpty(parentDir))
+                    {
+                        Directory.CreateDirectory(parentDir);
+                    }
+
+                    entry.ExtractToFile(targetPath, true);
+                }
+            }
+        }
+
+        private static string SafeCombineWithinDirectory(string destDir, string untrustedName)
+        {
+            string bareName = Path.GetFileName(untrustedName);
+            if (string.IsNullOrEmpty(bareName)) return null;
+
+            string destFull = Path.GetFullPath(destDir);
+            if (!destFull.EndsWith(Path.DirectorySeparatorChar.ToString()))
+                destFull += Path.DirectorySeparatorChar;
+
+            string candidate = Path.GetFullPath(Path.Combine(destFull, bareName));
+            if (!candidate.StartsWith(destFull, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            return candidate;
+        }
+
+        private static byte[] GetVirtualFileContents(object dataObject, int index)
+        {
+            System.Runtime.InteropServices.ComTypes.IDataObject comData = dataObject as System.Runtime.InteropServices.ComTypes.IDataObject;
+            if (comData == null) return null;
+
+            System.Runtime.InteropServices.ComTypes.FORMATETC formatEtc = new System.Runtime.InteropServices.ComTypes.FORMATETC
+            {
+                cfFormat = (short)DataFormats.GetFormat("FileContents").Id,
+                ptd = IntPtr.Zero,
+                dwAspect = System.Runtime.InteropServices.ComTypes.DVASPECT.DVASPECT_CONTENT,
+                lindex = index,
+                tymed = System.Runtime.InteropServices.ComTypes.TYMED.TYMED_ISTREAM | System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL
+            };
+
+            System.Runtime.InteropServices.ComTypes.STGMEDIUM medium;
+            try
+            {
+                comData.GetData(ref formatEtc, out medium);
+            }
+            catch
+            {
+                return null;
+            }
+
+            try
+            {
+                if (medium.tymed == System.Runtime.InteropServices.ComTypes.TYMED.TYMED_ISTREAM)
+                {
+                    System.Runtime.InteropServices.ComTypes.IStream nativeStream =
+                        (System.Runtime.InteropServices.ComTypes.IStream)Marshal.GetObjectForIUnknown(medium.unionmember);
+
+                    System.Runtime.InteropServices.ComTypes.STATSTG stat;
+                    nativeStream.Stat(out stat, 0);
+                    int size = (int)stat.cbSize;
+
+                    byte[] buffer = new byte[size];
+                    nativeStream.Read(buffer, size, IntPtr.Zero);
+                    return buffer;
+                }
+                else if (medium.tymed == System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL)
+                {
+                    IntPtr ptr = GlobalLock(medium.unionmember);
+                    if (ptr == IntPtr.Zero) return null;
+                    try
+                    {
+                        int size = GlobalSize(medium.unionmember);
+                        byte[] buffer = new byte[size];
+                        Marshal.Copy(ptr, buffer, 0, size);
+                        return buffer;
+                    }
+                    finally
+                    {
+                        GlobalUnlock(medium.unionmember);
+                    }
+                }
+            }
+            finally
+            {
+                ReleaseStgMedium(ref medium);
+            }
+
+            return null;
+        }
+
+        private const string DefaultGamePath = @"C:\Program Files (x86)\Steam\steamapps\common\Motor Town\MotorTown\Content\Paks";
+        private const string ConfigFileName = "config.json";
+        private const string AppVersion = "0.2";
+        private readonly string serverStorageDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ServerMods");
+        private readonly string settingsFilePath;
+        private readonly string backupStorageDir;
+        private readonly string saveGameBackupDir;
+        private string customEngineIniPath = null;
+
+        private TextBox txtGamePath;
+        private ComboBox cboServerDropdown;
+        private TextBox txtServerSearchBox;
+        private ComboBox cboThemeSelector;
+        private TextBox txtModSearchBox;
+        private ListBox lstServerPaks;
+        private Panel pnlDropTarget;
+        private Label lblDropInstruction;
+        private Panel pnlDragOverlay;
+        private readonly Timer dragLeaveTimer = new Timer { Interval = 90 };
+        private Panel pnlBusyOverlay;
+        private readonly Timer busySpinnerTimer = new Timer { Interval = 30 };
+        private float busySpinnerAngle = 0f;
+        private string busyStatusText = "Working...";
+        private Panel pnlListSplitter;
+        private Dictionary<Control, int> listSplitterControlOffsets;
+        private CheckBox chkSmartMatching;
+        private CheckBox chkAutoEngineIni;
+        private ComboBox cboEditorSelector;
+
+        private Label lblPathHeader;
+        private Label lblServerHeader;
+        private Label lblThemeHeader;
+        private Label lblModSearchHeader;
+        private Label lblEditorHeader;
+        private Button btnBrowsePath;
+        private Button btnOpenDirectory;
+        private Button btnAddServerFolder;
+        private Button btnDeleteServerFolder;
+        private Button btnDeleteSelectedPak;
+        private Button btnMergeServerMods;
+        private Button btnDeployMods;
+        private Button btnRevertVanilla;
+        private Button btnBackupPaks;
+        private Button btnRestoreBackup;
+        private Button btnBackupSaves;
+        private Button btnManageSaves;
+        private Button btnLaunchGame;
+        private Button btnOpenEngineIni;
+        private Button btnOpenSaveDirectory;
+
+        private List<string> cachedServerPaks = new List<string>();
+        private List<string> cachedServerFolders = new List<string>();
+
+        private readonly Color ThemeDarkBg = Color.FromArgb(30, 30, 36);
+        private readonly Color ThemeControlDark = Color.FromArgb(42, 44, 53);
+        private readonly Color AccentOrange = Color.FromArgb(255, 123, 0);
+        private readonly Color AccentYellow = Color.FromArgb(255, 200, 0);
+        private readonly Color TextLight = Color.FromArgb(240, 240, 240);
+        private readonly Color TextMuted = Color.FromArgb(180, 185, 195);
+
+        [STAThread]
+        public static void Main()
+        {
+            try
+            {
+                try { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); } catch { }
+
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new ModManagerForm());
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Fatal Startup Error: " + ex.ToString(), "Launch Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        public ModManagerForm()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+
+            Text = "MotorTown: Behind The Wheel - Mod Manager";
+            Width = 560;
+            Height = 1170;
+            MinimumSize = new Size(560, 1170);
+
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            backupStorageDir = Path.Combine(serverStorageDir, "Backup_Vanilla");
+            saveGameBackupDir = Path.Combine(serverStorageDir, "Backup_Saves");
+            settingsFilePath = Path.Combine(serverStorageDir, "settings.txt");
+
+            EnsureStorageDirectoryExists();
+            InitializeComponentLayout();
+
+            WrapControlWithLightModeBorder(cboThemeSelector);
+            WrapControlWithLightModeBorder(txtServerSearchBox);
+            WrapControlWithLightModeBorder(cboServerDropdown);
+            WrapControlWithLightModeBorder(txtModSearchBox);
+            WrapControlWithLightModeBorder(cboEditorSelector);
+
+            BuildDragOverlay();
+            BuildBusyOverlay();
+            SetupListResizeSplitter();
+
+            dragLeaveTimer.Tick += delegate { dragLeaveTimer.Stop(); HideDragOverlay(); };
+
+            // Make the whole window (not just the drop panel) a drag-and-drop target, so
+            // dragging a file anywhere over the app - not just the little panel - triggers
+            // the full-screen overlay and accepts the drop.
+            EnableDragDropRecursive(this);
+            
+            LoadCheckboxSettings();
+
+            if (cboThemeSelector.SelectedIndex == -1)
+            {
+                cboThemeSelector.SelectedIndex = 0; 
+            }
+            if (cboEditorSelector.SelectedIndex == -1)
+            {
+                cboEditorSelector.SelectedIndex = 0;
+            }
+
+            LoadInitialPath();
+            RefreshServerList();
+        }
+
+        private void EnableDragDropRecursive(Control parent)
+        {
+            parent.AllowDrop = true;
+            parent.DragEnter += OnPanelDragEnter;
+            parent.DragLeave += AnyControl_DragLeave;
+            parent.DragDrop += OnPanelDragDrop;
+
+            foreach (Control child in parent.Controls)
+            {
+                EnableDragDropRecursive(child);
+            }
+        }
+
+        private void BuildDragOverlay()
+        {
+            pnlDragOverlay = new DoubleBufferedPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(20, 20, 24),
+                Visible = false
+            };
+
+            Label lblOverlayText = new Label
+            {
+                Text = "Drop .pak, .zip or ReadMe Files Here",
+                Font = new Font(FontFamily.GenericSansSerif, 18, FontStyle.Bold),
+                ForeColor = Color.White,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+
+            pnlDragOverlay.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                int margin = 22;
+                Rectangle borderRect = new Rectangle(margin, margin, pnlDragOverlay.Width - (margin * 2), pnlDragOverlay.Height - (margin * 2));
+                using (Pen whitePen = new Pen(Color.White, 4f) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dash })
+                {
+                    pe.Graphics.DrawRectangle(whitePen, borderRect);
+                }
+            };
+
+            pnlDragOverlay.Controls.Add(lblOverlayText);
+            Controls.Add(pnlDragOverlay);
+            pnlDragOverlay.BringToFront();
+        }
+
+        private void BuildBusyOverlay()
+        {
+            pnlBusyOverlay = new DoubleBufferedPanel { Dock = DockStyle.Fill, Visible = false };
+
+            pnlBusyOverlay.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                bool isLight = IsLightTheme();
+                pe.Graphics.Clear(isLight ? Color.FromArgb(235, 250, 250, 250) : Color.FromArgb(235, 20, 20, 24));
+                pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+                int size = 48;
+                Rectangle spinnerRect = new Rectangle(pnlBusyOverlay.Width / 2 - size / 2, pnlBusyOverlay.Height / 2 - size / 2 - 16, size, size);
+                Color spinnerColor = isLight ? Color.FromArgb(70, 70, 70) : Color.White;
+                using (Pen spinnerPen = new Pen(spinnerColor, 4.5f) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round })
+                {
+                    pe.Graphics.DrawArc(spinnerPen, spinnerRect, busySpinnerAngle, 270);
+                }
+
+                Rectangle textRect = new Rectangle(0, spinnerRect.Bottom + 14, pnlBusyOverlay.Width, 30);
+                Color textColor = isLight ? Color.FromArgb(40, 40, 40) : TextLight;
+                using (Font statusFont = new Font(FontFamily.GenericSansSerif, 10, FontStyle.Bold))
+                {
+                    TextRenderer.DrawText(pe.Graphics, busyStatusText, statusFont, textRect, textColor, TextFormatFlags.HorizontalCenter);
+                }
+            };
+
+            busySpinnerTimer.Tick += delegate
+            {
+                busySpinnerAngle = (busySpinnerAngle + 18f) % 360f;
+                if (pnlBusyOverlay.Visible) pnlBusyOverlay.Invalidate();
+            };
+
+            Controls.Add(pnlBusyOverlay);
+        }
+
+        // Shows a full-window, theme-aware spinner that blocks interaction with the rest of
+        // the app (it simply covers everything, on top) without freezing the window itself -
+        // the actual work is expected to run on a background thread via Task.Run while this
+        // is visible, so the UI stays responsive and repaints normally.
+        private void ShowBusyOverlay(string statusText)
+        {
+            busyStatusText = statusText;
+            pnlBusyOverlay.Visible = true;
+            pnlBusyOverlay.BringToFront();
+            busySpinnerTimer.Start();
+        }
+
+        private void HideBusyOverlay()
+        {
+            busySpinnerTimer.Stop();
+            pnlBusyOverlay.Visible = false;
+        }
+
+        private void SetupListResizeSplitter()
+        {
+            const int MinListHeight = 60;
+            const int MaxListHeight = 400;
+
+            pnlListSplitter = new DoubleBufferedPanel
+            {
+                Location = new Point(lstServerPaks.Left, lstServerPaks.Bottom + 1),
+                Width = lstServerPaks.Width,
+                Height = 10,
+                Cursor = Cursors.SizeNS,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+
+            pnlListSplitter.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                bool isLight = IsLightTheme();
+                int midY = pnlListSplitter.Height / 2;
+                int centerX = pnlListSplitter.Width / 2;
+                using (Pen gripPen = new Pen(isLight ? Color.Gray : TextMuted, 2f))
+                {
+                    pe.Graphics.DrawLine(gripPen, centerX - 18, midY, centerX + 18, midY);
+                }
+            };
+
+            // Remember every control that currently sits below the list, as an offset from
+            // the list's bottom edge, so they can all be shifted down/up together whenever
+            // the list is resized - otherwise resizing the list would make it overlap the
+            // buttons below it instead of pushing them out of the way. Everything in this
+            // set was switched to Top-only anchoring (see InitializeComponentLayout) so
+            // WinForms' own anchor engine never fights with this manual repositioning - that
+            // fight is what caused the splitter to "disconnect" whenever the window itself
+            // was resized.
+            listSplitterControlOffsets = new Dictionary<Control, int>();
+            int listBottom = lstServerPaks.Bottom;
+            foreach (Control ctrl in Controls)
+            {
+                if (ctrl != lstServerPaks && ctrl.Top >= listBottom)
+                {
+                    listSplitterControlOffsets[ctrl] = ctrl.Top - listBottom;
+                }
+            }
+
+            int dragStartMouseY = 0;
+            int dragStartListHeight = 0;
+            bool isDraggingSplitter = false;
+
+            pnlListSplitter.MouseDown += delegate(object s, MouseEventArgs e)
+            {
+                dragStartMouseY = Cursor.Position.Y;
+                dragStartListHeight = lstServerPaks.Height;
+                isDraggingSplitter = true;
+            };
+
+            pnlListSplitter.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                if (!isDraggingSplitter || e.Button != MouseButtons.Left) return;
+
+                int desiredHeight = dragStartListHeight + (Cursor.Position.Y - dragStartMouseY);
+                desiredHeight = Math.Max(MinListHeight, Math.Min(MaxListHeight, desiredHeight));
+
+                int heightDelta = desiredHeight - lstServerPaks.Height;
+                if (heightDelta == 0) return;
+
+                // SuspendLayout only batches layout MATH (anchor/dock recalculation) - it does
+                // NOT stop the OS from repainting each moved child window as it's moved. With
+                // ~20 controls being repositioned on every mouse-move tick, that produced the
+                // "hundreds of buttons" ghosting glitch. WM_SETREDRAW actually suspends
+                // painting at the window level, so nothing is drawn until the single Update()
+                // call at the end - eliminating the ghosting at its real cause.
+                SendMessage(Handle, WM_SETREDRAW, (IntPtr)0, IntPtr.Zero);
+                SuspendLayout();
+
+                lstServerPaks.Height = desiredHeight;
+                RepositionControlsBelowList();
+
+                // Resized live (not deferred to mouse-up) so the window never clips content
+                // while dragging down, and dragging back up shrinks it smoothly in real time
+                // instead of leaving it the wrong size afterward. Order matters: shrink the
+                // floor before the window when getting smaller, and grow the window before
+                // the floor when getting bigger, or WinForms clamps the Height change against
+                // a stale MinimumSize.
+                int newMinHeight = MinimumSize.Height + heightDelta;
+                if (heightDelta < 0)
+                {
+                    MinimumSize = new Size(MinimumSize.Width, newMinHeight);
+                    Height += heightDelta;
+                }
+                else
+                {
+                    Height += heightDelta;
+                    MinimumSize = new Size(MinimumSize.Width, newMinHeight);
+                }
+
+                ResumeLayout(false);
+                SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
+                Invalidate(true);
+                Update();
+            };
+
+            pnlListSplitter.MouseUp += delegate(object s, MouseEventArgs e)
+            {
+                isDraggingSplitter = false;
+            };
+
+            Controls.Add(pnlListSplitter);
+            pnlListSplitter.BringToFront();
+        }
+
+        private void RepositionControlsBelowList()
+        {
+            pnlListSplitter.Top = lstServerPaks.Bottom + 1;
+
+            int newListBottom = lstServerPaks.Bottom;
+            foreach (KeyValuePair<Control, int> kvp in listSplitterControlOffsets)
+            {
+                kvp.Key.Top = newListBottom + kvp.Value;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+
+            // Allow drag-and-drop messages through even if this process is running elevated.
+            try
+            {
+                ChangeWindowMessageFilterEx(Handle, WM_DROPFILES, MSGFLT_ALLOW, IntPtr.Zero);
+                ChangeWindowMessageFilterEx(Handle, WM_COPYDATA, MSGFLT_ALLOW, IntPtr.Zero);
+                ChangeWindowMessageFilterEx(Handle, WM_COPYGLOBALDATA, MSGFLT_ALLOW, IntPtr.Zero);
+            }
+            catch { }
+        }
+
+        private string GetEffectiveEngineIniPath()
+        {
+            if (!string.IsNullOrEmpty(customEngineIniPath) && File.Exists(customEngineIniPath))
+            {
+                return customEngineIniPath;
+            }
+
+            string defaultPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"MotorTown\Saved\Config\Windows\Engine.ini");
+            if (File.Exists(defaultPath))
+            {
+                return defaultPath;
+            }
+
+            return defaultPath;
+        }
+
+        private bool EnsureEngineIniExists(out string targetPath)
+        {
+            targetPath = GetEffectiveEngineIniPath();
+
+            if (File.Exists(targetPath))
+            {
+                return true;
+            }
+
+            DialogResult result = MessageBox.Show(
+                "Could not locate 'Engine.ini' automatically.\n\nWould you like to browse and locate your 'Engine.ini' file manually?",
+                "Engine.ini Not Found",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (result == DialogResult.Yes)
+            {
+                using (OpenFileDialog ofd = new OpenFileDialog())
+                {
+                    ofd.Title = "Select Engine.ini File";
+                    ofd.Filter = "INI Configuration Files (*.ini)|*.ini|All Files (*.*)|*.*";
+                    ofd.FileName = "Engine.ini";
+
+                    if (ofd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        customEngineIniPath = ofd.FileName;
+                        SaveCheckboxSettings();
+                        targetPath = customEngineIniPath;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private void EnsureStorageDirectoryExists()
+        {
+            try
+            {
+                if (!Directory.Exists(serverStorageDir))
+                    Directory.CreateDirectory(serverStorageDir);
+                if (!Directory.Exists(backupStorageDir))
+                    Directory.CreateDirectory(backupStorageDir);
+                if (!Directory.Exists(saveGameBackupDir))
+                    Directory.CreateDirectory(saveGameBackupDir);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Initializing Storage Directory", ex);
+            }
+        }
+
+        private void LoadCheckboxSettings()
+        {
+            try
+            {
+                if (File.Exists(settingsFilePath))
+                {
+                    string[] lines = File.ReadAllLines(settingsFilePath);
+                    foreach (string line in lines)
+                    {
+                        if (line.StartsWith("SmartMatching=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            bool val;
+                            if (bool.TryParse(line.Substring(13).Trim(), out val))
+                                chkSmartMatching.Checked = val;
+                        }
+                        else if (line.StartsWith("AutoEngineIni=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            bool val;
+                            if (bool.TryParse(line.Substring(14).Trim(), out val))
+                                chkAutoEngineIni.Checked = val;
+                        }
+                        else if (line.StartsWith("Theme=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string theme = line.Substring(6).Trim();
+                            for (int i = 0; i < cboThemeSelector.Items.Count; i++)
+                            {
+                                if (cboThemeSelector.Items[i].ToString().Equals(theme, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    cboThemeSelector.SelectedIndex = i;
+                                    break;
+                                }
+                            }
+                        }
+                        else if (line.StartsWith("PreferredEditor=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string editor = line.Substring(16).Trim();
+                            for (int i = 0; i < cboEditorSelector.Items.Count; i++)
+                            {
+                                if (cboEditorSelector.Items[i].ToString().Equals(editor, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    cboEditorSelector.SelectedIndex = i;
+                                    break;
+                                }
+                            }
+                        }
+                        else if (line.StartsWith("EngineIniPath=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string path = line.Substring(14).Trim();
+                            if (!string.IsNullOrEmpty(path))
+                            {
+                                customEngineIniPath = path;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void SaveCheckboxSettings()
+        {
+            try
+            {
+                string themeName = (cboThemeSelector.SelectedItem != null) ? cboThemeSelector.SelectedItem.ToString() : "Dark Mode";
+                string editorName = (cboEditorSelector.SelectedItem != null) ? cboEditorSelector.SelectedItem.ToString() : "Windows Notepad";
+                string iniPathEntry = !string.IsNullOrEmpty(customEngineIniPath) ? customEngineIniPath : "";
+                
+                string content = "SmartMatching=" + chkSmartMatching.Checked.ToString() + "\n" +
+                                 "AutoEngineIni=" + chkAutoEngineIni.Checked.ToString() + "\n" +
+                                 "Theme=" + themeName + "\n" +
+                                 "PreferredEditor=" + editorName + "\n" +
+                                 "EngineIniPath=" + iniPathEntry + "\n";
+                File.WriteAllText(settingsFilePath, content);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Saving Checkbox Settings", ex);
+            }
+        }
+
+        private void InitializeComponentLayout()
+        {
+            lblPathHeader = new Label { Text = "Game Paks Directory:", Location = new Point(15, 15), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            Controls.Add(lblPathHeader);
+
+            txtGamePath = new TextBox { Location = new Point(15, 35), Width = 310, BorderStyle = BorderStyle.FixedSingle, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            Controls.Add(txtGamePath);
+
+            btnBrowsePath = new ShinyButton { Text = "Browse...", Location = new Point(335, 33), Width = 90, Height = 25, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnBrowsePath.Click += OnBrowsePathClicked;
+            Controls.Add(btnBrowsePath);
+
+            btnOpenDirectory = new ShinyButton { Text = "Open Folder", Location = new Point(430, 33), Width = 90, Height = 25, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnOpenDirectory.Click += OnOpenDirectoryClicked;
+            Controls.Add(btnOpenDirectory);
+
+            lblThemeHeader = new Label { Text = "Theme:", Location = new Point(15, 70), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            Controls.Add(lblThemeHeader);
+
+            cboThemeSelector = new ComboBox { Location = new Point(15, 90), Width = 505, DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            cboThemeSelector.DrawItem += ThemedComboBox_DrawItem;
+            cboThemeSelector.Items.Add("Dark Mode");
+            cboThemeSelector.Items.Add("Light Mode");
+            cboThemeSelector.Items.Add("Cerulean Blue");
+            cboThemeSelector.Items.Add("Amethyst Purple");
+            cboThemeSelector.SelectedIndexChanged += delegate(object s, EventArgs e) 
+            { 
+                if (cboThemeSelector.SelectedItem != null) 
+                {
+                    ApplyTheme(cboThemeSelector.SelectedItem.ToString());
+                    SaveCheckboxSettings();
+                } 
+            };
+            Controls.Add(cboThemeSelector);
+
+            lblServerHeader = new Label { Text = "Select / Search Target Server:", Location = new Point(15, 125), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            Controls.Add(lblServerHeader);
+
+            txtServerSearchBox = new TextBox { Location = new Point(15, 145), Width = 160, BorderStyle = BorderStyle.FixedSingle, Anchor = AnchorStyles.Top | AnchorStyles.Left };
+            txtServerSearchBox.TextChanged += OnServerSearchChanged;
+            Controls.Add(txtServerSearchBox);
+
+            cboServerDropdown = new ComboBox { Location = new Point(180, 145), Width = 340, DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            cboServerDropdown.DrawItem += ThemedComboBox_DrawItem;
+            cboServerDropdown.SelectedIndexChanged += delegate(object s, EventArgs e) { LoadSelectedServerPaks(); };
+            Controls.Add(cboServerDropdown);
+
+            lblModSearchHeader = new Label { Text = "Search Mods:", Location = new Point(15, 180), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            Controls.Add(lblModSearchHeader);
+
+            txtModSearchBox = new TextBox { Location = new Point(15, 200), Width = 160, BorderStyle = BorderStyle.FixedSingle, Anchor = AnchorStyles.Top | AnchorStyles.Left };
+            txtModSearchBox.TextChanged += OnModSearchChanged;
+            Controls.Add(txtModSearchBox);
+
+            lstServerPaks = new ListBox { Location = new Point(15, 235), Width = 505, Height = 95, BorderStyle = BorderStyle.FixedSingle, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            Controls.Add(lstServerPaks);
+
+            btnAddServerFolder = new ShinyButton { Text = "Add Server", Location = new Point(15, 342), Width = 120, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left, Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold) };
+            btnAddServerFolder.Click += OnAddServerClicked;
+            Controls.Add(btnAddServerFolder);
+
+            btnDeleteServerFolder = new ShinyButton { Text = "Delete Server", Location = new Point(141, 342), Width = 120, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left, Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold) };
+            btnDeleteServerFolder.Click += OnDeleteServerClicked;
+            Controls.Add(btnDeleteServerFolder);
+
+            btnDeleteSelectedPak = new ShinyButton { Text = "Delete Mod", Location = new Point(267, 342), Width = 120, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left, Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold) };
+            btnDeleteSelectedPak.Click += OnDeleteModClicked;
+            Controls.Add(btnDeleteSelectedPak);
+
+            btnMergeServerMods = new ShinyButton { Text = "Merge Servers", Location = new Point(393, 342), Width = 127, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold) };
+            btnMergeServerMods.Click += OnMergeServerModsClicked;
+            Controls.Add(btnMergeServerMods);
+
+            btnDeployMods = new ShinyButton { Text = "Deploy Mods To Game", Location = new Point(15, 380), Width = 505, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9.5f, FontStyle.Bold) };
+            btnDeployMods.Click += OnDeployModsClicked;
+            Controls.Add(btnDeployMods);
+
+            btnRevertVanilla = new ShinyButton { Text = "Remove All Mods (Vanilla)", Location = new Point(15, 418), Width = 505, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9.5f, FontStyle.Bold) };
+            btnRevertVanilla.Click += OnRevertVanillaClicked;
+            Controls.Add(btnRevertVanilla);
+
+            btnBackupPaks = new ShinyButton { Text = "Backup Main Game File", Location = new Point(15, 456), Width = 245, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnBackupPaks.Click += OnBackupPaksClicked;
+            Controls.Add(btnBackupPaks);
+
+            btnRestoreBackup = new ShinyButton { Text = "Restore Main Game File", Location = new Point(275, 456), Width = 245, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnRestoreBackup.Click += OnRestoreBackupClicked;
+            Controls.Add(btnRestoreBackup);
+
+            btnBackupSaves = new ShinyButton { Text = "Backup Character Saves", Location = new Point(15, 494), Width = 245, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnBackupSaves.Click += OnBackupSavesClicked;
+            Controls.Add(btnBackupSaves);
+
+            btnManageSaves = new ShinyButton { Text = "Manage / Restore Saves", Location = new Point(275, 494), Width = 245, Height = 30, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnManageSaves.Click += OnManageSavesClicked;
+            Controls.Add(btnManageSaves);
+
+            lblEditorHeader = new Label { Text = "Preferred Text Editor:", Location = new Point(15, 533), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            Controls.Add(lblEditorHeader);
+
+            cboEditorSelector = new ComboBox { Location = new Point(15, 553), Width = 505, DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            cboEditorSelector.DrawItem += ThemedComboBox_DrawItem;
+            cboEditorSelector.Items.Add("Windows Notepad");
+            cboEditorSelector.Items.Add("Notepad++");
+            cboEditorSelector.Items.Add("VS Code");
+            cboEditorSelector.SelectedIndexChanged += delegate(object s, EventArgs e) 
+            { 
+                UpdateOpenEngineIniButtonText();
+                SaveCheckboxSettings();
+            };
+            Controls.Add(cboEditorSelector);
+
+            btnOpenEngineIni = new ShinyButton { Text = "Open Engine.ini in Windows Notepad", Location = new Point(15, 588), Width = 505, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnOpenEngineIni.Click += OnOpenEngineIniClicked;
+            Controls.Add(btnOpenEngineIni);
+
+            btnOpenSaveDirectory = new ShinyButton { Text = "Open Save File Folder", Location = new Point(15, 622), Width = 505, Height = 28, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            btnOpenSaveDirectory.Click += OnOpenSaveDirectoryClicked;
+            Controls.Add(btnOpenSaveDirectory);
+
+            btnLaunchGame = new ShinyButton { Text = "Launch Motor Town (Steam)", Location = new Point(15, 658), Width = 505, Height = 32, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Font = new Font(FontFamily.GenericSansSerif, 9.5f, FontStyle.Bold) };
+            btnLaunchGame.Click += OnLaunchGameClicked;
+            Controls.Add(btnLaunchGame);
+
+            chkSmartMatching = new CheckBox
+            {
+                Text = "Enable Smart Version Matching (Auto-detect older mod versions)",
+                Location = new Point(15, 698),
+                Width = 505,
+                Checked = true,
+                Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Regular),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            chkSmartMatching.CheckedChanged += OnCheckboxSettingChanged;
+            Controls.Add(chkSmartMatching);
+
+            chkAutoEngineIni = new CheckBox
+            {
+                Text = "Enable Auto Engine.ini Smart-Merge on Zip Drop",
+                Location = new Point(15, 728),
+                Width = 505,
+                Checked = true,
+                Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Regular),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            chkAutoEngineIni.CheckedChanged += OnCheckboxSettingChanged;
+            Controls.Add(chkAutoEngineIni);
+
+            pnlDropTarget = new Panel
+            {
+                Location = new Point(15, 762),
+                Width = 505,
+                Height = 155,
+                BorderStyle = BorderStyle.FixedSingle,
+                AllowDrop = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+
+            lblDropInstruction = new Label
+            {
+                Text = "Drag and Drop .pak, .zip or ReadMe Files Here\n\n(Auto-extracts Paks, Reads Readmes & Smart-Merges Engine.ini)",
+                Font = new Font(FontFamily.GenericSansSerif, 10, FontStyle.Bold),
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleCenter,
+                AllowDrop = true,
+                BackColor = Color.Transparent
+            };
+
+            pnlDropTarget.Controls.Add(lblDropInstruction);
+
+            Controls.Add(pnlDropTarget);
+
+            AttachSearchIcon(txtServerSearchBox);
+            AttachSearchIcon(txtModSearchBox);
+        }
+
+        private void UpdateOpenEngineIniButtonText()
+        {
+            string editor = (cboEditorSelector.SelectedItem != null) ? cboEditorSelector.SelectedItem.ToString() : "Windows Notepad";
+            btnOpenEngineIni.Text = "Open Engine.ini in " + editor;
+        }
+
+        private void AttachSearchIcon(TextBox textBox)
+        {
+            PictureBox iconBox = new PictureBox
+            {
+                Size = new Size(16, 16),
+                Location = new Point(3, 2),
+                Cursor = Cursors.IBeam,
+                BackColor = Color.Transparent
+            };
+
+            iconBox.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                Color color = (cboThemeSelector.SelectedItem != null && cboThemeSelector.SelectedItem.ToString() == "Light Mode") 
+                    ? Color.Gray 
+                    : AccentOrange;
+
+                using (Pen pen = new Pen(color, 1.8f))
+                {
+                    pe.Graphics.DrawEllipse(pen, 1, 1, 8, 8);
+                    pe.Graphics.DrawLine(pen, 8, 8, 13, 13);
+                }
+            };
+
+            iconBox.Click += delegate(object s, EventArgs e) { textBox.Focus(); };
+
+            Panel paddingPanel = new Panel
+            {
+                Size = new Size(20, textBox.ClientSize.Height),
+                Dock = DockStyle.Left,
+                BackColor = Color.Transparent
+            };
+            paddingPanel.Controls.Add(iconBox);
+            textBox.Controls.Add(paddingPanel);
+
+            SendMessage(textBox.Handle, EM_SETMARGINS, (IntPtr)EC_LEFTMARGIN, (IntPtr)(20 & 0xFFFF));
+        }
+
+        private class ThemeColors
+        {
+            public Color WindowBg;
+            public Color ControlBg;
+            public Color TextColor;
+            public Color HeaderColor;
+            public Color ButtonBg;
+            public Color ButtonFg;
+            public Color AccentColor;
+            public bool IsLightBase;
+            public bool UseBlackBorder;
+            public bool UseDarkScrollbar;
+            public bool DarkTitleBar;
+            public Color TitleBarColor;
+            public Color TitleBarTextColor;
+        }
+
+        private string CurrentThemeName()
+        {
+            return cboThemeSelector.SelectedItem != null ? cboThemeSelector.SelectedItem.ToString() : "Dark Mode";
+        }
+
+        private ThemeColors GetThemeColors(string themeName)
+        {
+            switch (themeName)
+            {
+                case "Light Mode":
+                    return new ThemeColors
+                    {
+                        WindowBg = SystemColors.Control,
+                        ControlBg = SystemColors.Window,
+                        TextColor = SystemColors.WindowText,
+                        HeaderColor = SystemColors.ControlText,
+                        ButtonBg = SystemColors.ControlLight,
+                        ButtonFg = SystemColors.ControlText,
+                        AccentColor = SystemColors.ControlLight,
+                        IsLightBase = true,
+                        UseBlackBorder = true,
+                        UseDarkScrollbar = false,
+                        DarkTitleBar = false,
+                        TitleBarColor = SystemColors.Control,
+                        TitleBarTextColor = SystemColors.ControlText
+                    };
+                case "Cerulean Blue":
+                    return new ThemeColors
+                    {
+                        WindowBg = Color.FromArgb(16, 40, 61),
+                        ControlBg = Color.FromArgb(24, 56, 82),
+                        TextColor = Color.FromArgb(228, 242, 250),
+                        HeaderColor = Color.FromArgb(120, 202, 255),
+                        ButtonBg = Color.FromArgb(24, 56, 82),
+                        ButtonFg = Color.FromArgb(228, 242, 250),
+                        AccentColor = Color.FromArgb(0, 149, 217),
+                        IsLightBase = false,
+                        UseBlackBorder = false,
+                        UseDarkScrollbar = true,
+                        DarkTitleBar = true,
+                        TitleBarColor = Color.FromArgb(16, 40, 61),
+                        TitleBarTextColor = Color.FromArgb(228, 242, 250)
+                    };
+                case "Amethyst Purple":
+                    return new ThemeColors
+                    {
+                        WindowBg = Color.FromArgb(36, 22, 54),
+                        ControlBg = Color.FromArgb(52, 34, 76),
+                        TextColor = Color.FromArgb(238, 228, 248),
+                        HeaderColor = Color.FromArgb(198, 155, 240),
+                        ButtonBg = Color.FromArgb(52, 34, 76),
+                        ButtonFg = Color.FromArgb(238, 228, 248),
+                        AccentColor = Color.FromArgb(153, 102, 204),
+                        IsLightBase = false,
+                        UseBlackBorder = false,
+                        UseDarkScrollbar = true,
+                        DarkTitleBar = true,
+                        TitleBarColor = Color.FromArgb(36, 22, 54),
+                        TitleBarTextColor = Color.FromArgb(238, 228, 248)
+                    };
+                default: // "Dark Mode"
+                    return new ThemeColors
+                    {
+                        WindowBg = ThemeDarkBg,
+                        ControlBg = ThemeControlDark,
+                        TextColor = TextLight,
+                        HeaderColor = AccentYellow,
+                        ButtonBg = ThemeControlDark,
+                        ButtonFg = TextLight,
+                        AccentColor = AccentOrange,
+                        IsLightBase = false,
+                        UseBlackBorder = false,
+                        UseDarkScrollbar = true,
+                        DarkTitleBar = true,
+                        TitleBarColor = ThemeDarkBg,
+                        TitleBarTextColor = TextLight
+                    };
+            }
+        }
+
+        private bool IsLightTheme()
+        {
+            return CurrentThemeName() == "Light Mode";
+        }
+
+        // ComboBox and TextBox don't expose a reliable way to force a specific border color -
+        // their default border can look nearly invisible against a light background. This
+        // draws a crisp black frame using a SEPARATE sibling panel positioned just outside the
+        // control's existing bounds - deliberately NOT by reparenting/docking the control
+        // itself into a container, since doing that to an edit control can silently break its
+        // own text/caret rendering (exactly what happened to the mod search box previously).
+        // The original control is never touched: same parent, same position, same everything.
+        private void WrapControlWithLightModeBorder(Control inner)
+        {
+            Panel borderPanel = new DoubleBufferedPanel
+            {
+                Location = new Point(inner.Left - 1, inner.Top - 1),
+                Size = new Size(inner.Width + 2, inner.Height + 2),
+                Anchor = inner.Anchor
+            };
+
+            borderPanel.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                if (IsLightTheme())
+                {
+                    using (Pen borderPen = new Pen(Color.Black, 1f))
+                    {
+                        pe.Graphics.DrawRectangle(borderPen, 0, 0, borderPanel.Width - 1, borderPanel.Height - 1);
+                    }
+                }
+            };
+
+            inner.Parent.Controls.Add(borderPanel);
+        }
+
+        // Setting ComboBox.BackColor/ForeColor alone only reliably recolors the closed box -
+        // the open dropdown list often still renders with the system's default white
+        // background on Windows regardless of those properties. Owner-drawing every item
+        // guarantees the dropdown itself matches the current theme too.
+        private void ThemedComboBox_DrawItem(object sender, DrawItemEventArgs e)
+        {
+            ComboBox combo = sender as ComboBox;
+            if (combo == null || e.Index < 0) return;
+
+            ThemeColors t = GetThemeColors(CurrentThemeName());
+            bool isSelected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+
+            Color backColor = isSelected
+                ? (t.IsLightBase ? SystemColors.Highlight : t.AccentColor)
+                : (t.IsLightBase ? SystemColors.Window : t.ControlBg);
+            Color foreColor = isSelected
+                ? (t.IsLightBase ? SystemColors.HighlightText : Color.Black)
+                : (t.IsLightBase ? SystemColors.WindowText : t.TextColor);
+
+            using (SolidBrush backBrush = new SolidBrush(backColor))
+            {
+                e.Graphics.FillRectangle(backBrush, e.Bounds);
+            }
+
+            string text = combo.Items[e.Index].ToString();
+            TextRenderer.DrawText(e.Graphics, text, combo.Font, e.Bounds, foreColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+        }
+
+        // Recolors an entire dialog (and every control on it) to match whichever theme is
+        // currently selected in the main window, instead of the default light/white system
+        // colors WinForms dialogs get otherwise. Call this once, after all of a dialog's
+        // controls have been added, right before ShowDialog().
+        private void ApplyDialogTheme(Form dlg)
+        {
+            ThemeColors t = GetThemeColors(CurrentThemeName());
+
+            dlg.BackColor = t.WindowBg;
+            dlg.ForeColor = t.TextColor;
+
+            ApplyDialogThemeToControls(dlg.Controls, t);
+
+            try
+            {
+                int useDark = t.DarkTitleBar ? 1 : 0;
+                DwmSetWindowAttribute(dlg.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDark, sizeof(int));
+                int captionColorRef = ColorToColorRef(t.TitleBarColor);
+                DwmSetWindowAttribute(dlg.Handle, DWMWA_CAPTION_COLOR, ref captionColorRef, sizeof(int));
+                int textColorRef = ColorToColorRef(t.TitleBarTextColor);
+                DwmSetWindowAttribute(dlg.Handle, DWMWA_TEXT_COLOR, ref textColorRef, sizeof(int));
+            }
+            catch { }
+        }
+
+        private void ApplyDialogThemeToControls(Control.ControlCollection controls, ThemeColors t)
+        {
+            foreach (Control child in controls)
+            {
+                if (child is ShinyButton || child is Button)
+                {
+                    child.BackColor = t.ButtonBg;
+                    child.ForeColor = t.ButtonFg;
+                }
+                else if (child is TextBox || child is ComboBox || child is ListBox || child is CheckedListBox)
+                {
+                    child.BackColor = t.ControlBg;
+                    child.ForeColor = t.TextColor;
+                }
+                else if (child is Label || child is CheckBox || child is RadioButton)
+                {
+                    child.ForeColor = t.TextColor;
+                    child.BackColor = Color.Transparent;
+                }
+                else if (child is Panel || child is GroupBox || child is TableLayoutPanel || child is FlowLayoutPanel)
+                {
+                    child.BackColor = t.WindowBg;
+                }
+
+                if (child.Controls.Count > 0)
+                {
+                    ApplyDialogThemeToControls(child.Controls, t);
+                }
+            }
+        }
+
+        private void ApplyTheme(string themeName)
+        {
+            ThemeColors t = GetThemeColors(themeName);
+            bool isDarkModeSpecifically = (themeName == "Dark Mode");
+
+            BackgroundImage = null;
+            BackColor = t.WindowBg;
+
+            lblPathHeader.ForeColor = t.HeaderColor;
+            lblServerHeader.ForeColor = t.HeaderColor;
+            lblThemeHeader.ForeColor = t.HeaderColor;
+            lblModSearchHeader.ForeColor = t.HeaderColor;
+            lblEditorHeader.ForeColor = t.HeaderColor;
+            lblPathHeader.BackColor = Color.Transparent;
+            lblServerHeader.BackColor = Color.Transparent;
+            lblThemeHeader.BackColor = Color.Transparent;
+            lblModSearchHeader.BackColor = Color.Transparent;
+            lblEditorHeader.BackColor = Color.Transparent;
+
+            foreach (var ctrl in new Control[] { txtGamePath, txtServerSearchBox, cboServerDropdown, cboThemeSelector, cboEditorSelector, txtModSearchBox, lstServerPaks })
+            {
+                ctrl.BackColor = t.ControlBg;
+                ctrl.ForeColor = t.TextColor;
+            }
+
+            foreach (var btn in new Button[] { btnBrowsePath, btnOpenDirectory, btnBackupPaks, btnRestoreBackup, btnBackupSaves, btnManageSaves })
+            {
+                btn.BackColor = t.ButtonBg;
+                btn.ForeColor = t.ButtonFg;
+                btn.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+            }
+
+            // "Green like Launch Game, but only in Dark Mode" - normal theme-matching color
+            // everywhere else (Light Mode, and the new Cerulean/Amethyst themes).
+            Color addMergeColor = isDarkModeSpecifically ? Color.FromArgb(40, 140, 60) : t.ButtonBg;
+            btnAddServerFolder.BackColor = addMergeColor;
+            btnAddServerFolder.ForeColor = t.ButtonFg;
+            btnAddServerFolder.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnMergeServerMods.BackColor = addMergeColor;
+            btnMergeServerMods.ForeColor = t.ButtonFg;
+            btnMergeServerMods.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnDeleteServerFolder.BackColor = t.IsLightBase ? SystemColors.ControlLight : Color.FromArgb(160, 35, 35);
+            btnDeleteServerFolder.ForeColor = t.ButtonFg;
+            btnDeleteServerFolder.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnDeleteSelectedPak.BackColor = t.IsLightBase ? SystemColors.ControlLight : Color.FromArgb(160, 35, 35);
+            btnDeleteSelectedPak.ForeColor = t.ButtonFg;
+            btnDeleteSelectedPak.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnDeployMods.BackColor = t.IsLightBase ? SystemColors.ControlLight : t.AccentColor;
+            btnDeployMods.ForeColor = t.IsLightBase ? SystemColors.ControlText : Color.Black;
+            btnDeployMods.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnRevertVanilla.BackColor = t.IsLightBase ? SystemColors.ControlLight : Color.FromArgb(180, 80, 20);
+            btnRevertVanilla.ForeColor = t.ButtonFg;
+            btnRevertVanilla.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnOpenEngineIni.BackColor = t.ButtonBg;
+            btnOpenEngineIni.ForeColor = t.ButtonFg;
+            btnOpenEngineIni.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            btnOpenSaveDirectory.BackColor = t.ButtonBg;
+            btnOpenSaveDirectory.ForeColor = t.ButtonFg;
+            btnOpenSaveDirectory.FlatStyle = t.IsLightBase ? FlatStyle.Standard : FlatStyle.Flat;
+
+            // Launch Game stays green in every theme, always - it's never swept into the
+            // generic per-theme button coloring above.
+            btnLaunchGame.BackColor = Color.FromArgb(40, 140, 60);
+            btnLaunchGame.ForeColor = Color.White;
+            btnLaunchGame.FlatStyle = FlatStyle.Flat;
+
+            chkSmartMatching.ForeColor = t.TextColor;
+            chkSmartMatching.BackColor = Color.Transparent;
+
+            chkAutoEngineIni.ForeColor = t.TextColor;
+            chkAutoEngineIni.BackColor = Color.Transparent;
+
+            pnlDropTarget.BackColor = t.ControlBg;
+            lblDropInstruction.ForeColor = t.IsLightBase ? SystemColors.GrayText : TextMuted;
+
+            txtServerSearchBox.Invalidate();
+            txtModSearchBox.Invalidate();
+
+            ApplyListBoxScrollbarTheme(t.UseDarkScrollbar);
+            ApplyTitleBarTheme(t);
+
+            // Refresh everything so the light-mode border wrappers (which check the theme at
+            // paint time) show or hide immediately instead of waiting for some unrelated
+            // repaint to happen to notice the theme changed.
+            Invalidate(true);
+        }
+
+        private void ApplyListBoxScrollbarTheme(bool useDark)
+        {
+            try
+            {
+                SetWindowTheme(lstServerPaks.Handle, useDark ? "DarkMode_Explorer" : "Explorer", null);
+            }
+            catch { }
+        }
+
+        private void ApplyTitleBarTheme(ThemeColors t)
+        {
+            try
+            {
+                int useDark = t.DarkTitleBar ? 1 : 0;
+                DwmSetWindowAttribute(Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDark, sizeof(int));
+            }
+            catch { }
+
+            try
+            {
+                int captionColorRef = ColorToColorRef(t.TitleBarColor);
+                DwmSetWindowAttribute(Handle, DWMWA_CAPTION_COLOR, ref captionColorRef, sizeof(int));
+
+                int textColorRef = ColorToColorRef(t.TitleBarTextColor);
+                DwmSetWindowAttribute(Handle, DWMWA_TEXT_COLOR, ref textColorRef, sizeof(int));
+            }
+            catch { }
+            // Both calls above are wrapped separately and swallow failures individually - on
+            // Windows versions that don't support DWMWA_CAPTION_COLOR (pre-Windows 11), the
+            // title bar still gets the dark/light toggle from the first call even though the
+            // custom-color call fails.
+        }
+
+        private static int ColorToColorRef(Color c)
+        {
+            return c.R | (c.G << 8) | (c.B << 16);
+        }
+
+        private void ShowError(string context, Exception ex)
+        {
+            ShowThemedMessage("Mod Manager Error", "An error occurred while " + context + ".\n\nTechnical Details: " + ex.Message);
+        }
+
+        private void OnCheckboxSettingChanged(object sender, EventArgs e)
+        {
+            UpdateDropInstructionText();
+            SaveCheckboxSettings();
+        }
+
+        private void UpdateDropInstructionText()
+        {
+            string matchingPart = chkSmartMatching.Checked ? "Auto-extracts Paks, Reads Readmes" : "Auto-extracts Paks";
+            string iniPart = chkAutoEngineIni.Checked ? " & Smart-Merges Engine.ini" : "";
+            
+            lblDropInstruction.Text = "Drag and Drop .pak, .zip or ReadMe Files Here\n\n(" + matchingPart + iniPart + ")";
+        }
+
+        private void LoadInitialPath()
+        {
+            if (File.Exists(ConfigFileName))
+            {
+                try
+                {
+                    string json = File.ReadAllText(ConfigFileName);
+                    if (json.Contains("\"target_path\":"))
+                    {
+                        int start = json.IndexOf("\"target_path\":") + 14;
+                        int firstQuote = json.IndexOf("\"", start);
+                        int secondQuote = json.IndexOf("\"", firstQuote + 1);
+                        if (firstQuote != -1 && secondQuote != -1)
+                        {
+                            txtGamePath.Text = json.Substring(firstQuote + 1, secondQuote - firstQuote - 1).Replace("\\\\", "\\");
+                            return;
+                        }
+                    }
+                }
+                catch { }
+            }
+            txtGamePath.Text = DefaultGamePath;
+        }
+
+        private void PersistConfigPath(string path)
+        {
+            try
+            {
+                string json = "{\"target_path\":\"" + path.Replace("\\", "\\\\") + "\"}";
+                File.WriteAllText(ConfigFileName, json);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Saving Configuration Settings", ex);
+            }
+        }
+
+        private void ShowThemedMessage(string title, string message)
+        {
+            const int textWidth = 340;
+
+            Size measured = TextRenderer.MeasureText(message, Font, new Size(textWidth, 0), TextFormatFlags.WordBreak);
+            int textHeight = Math.Max(40, measured.Height);
+
+            Form dlg = new Form
+            {
+                Text = title,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ClientSize = new Size(380, textHeight + 90)
+            };
+
+            Label lblMessage = new Label
+            {
+                Text = message,
+                Location = new Point(20, 15),
+                Size = new Size(textWidth, textHeight),
+                AutoSize = false
+            };
+            dlg.Controls.Add(lblMessage);
+
+            ShinyButton btnOk = new ShinyButton { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(140, textHeight + 35), Width = 100, Height = 30 };
+            dlg.Controls.Add(btnOk);
+            dlg.AcceptButton = btnOk;
+            dlg.CancelButton = btnOk;
+
+            ApplyDialogTheme(dlg);
+            dlg.ShowDialog(this);
+        }
+
+
+        private void OnBrowsePathClicked(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog dialog = new FolderBrowserDialog())
+            {
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    txtGamePath.Text = dialog.SelectedPath;
+                    PersistConfigPath(dialog.SelectedPath);
+                }
+            }
+        }
+
+        private void OnOpenDirectoryClicked(object sender, EventArgs e)
+        {
+            string path = txtGamePath.Text;
+            if (Directory.Exists(path))
+            {
+                try { Process.Start("explorer.exe", path); }
+                catch (Exception ex) { ShowError("Opening Game Directory in Windows Explorer", ex); }
+            }
+            else
+            {
+                MessageBox.Show("The specified folder directory does not exist.", "Folder Not Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void OnOpenSaveDirectoryClicked(object sender, EventArgs e)
+        {
+            string savePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"MotorTown\Saved\SaveGames");
+            try
+            {
+                if (!Directory.Exists(savePath))
+                {
+                    Directory.CreateDirectory(savePath);
+                }
+                Process.Start("explorer.exe", savePath);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Opening Save File Directory in Windows Explorer", ex);
+            }
+        }
+
+        private void RefreshServerList()
+        {
+            try
+            {
+                cachedServerFolders.Clear();
+                cboServerDropdown.Items.Clear();
+
+                foreach (var dir in Directory.GetDirectories(serverStorageDir))
+                {
+                    string folderName = Path.GetFileName(dir);
+                    if (!folderName.Equals("Backup_Vanilla", StringComparison.OrdinalIgnoreCase) &&
+                        !folderName.Equals("Backup_Saves", StringComparison.OrdinalIgnoreCase) &&
+                        !folderName.Equals("Backup_CharacterSaves", StringComparison.OrdinalIgnoreCase) &&
+                        !folderName.Equals("MTModManager", StringComparison.OrdinalIgnoreCase))
+                    {
+                        cachedServerFolders.Add(folderName);
+                    }
+                }
+
+                FilterServers(txtServerSearchBox.Text);
+
+                if (cboServerDropdown.Items.Count > 0)
+                    cboServerDropdown.SelectedIndex = 0;
+                else
+                    LoadSelectedServerPaks();
+            }
+            catch (Exception ex)
+            {
+                ShowError("Loading Server Folders List", ex);
+            }
+        }
+
+        private void OnServerSearchChanged(object sender, EventArgs e)
+        {
+            FilterServers(txtServerSearchBox.Text);
+            if (cboServerDropdown.Items.Count > 0)
+                cboServerDropdown.SelectedIndex = 0;
+            else
+                LoadSelectedServerPaks();
+        }
+
+        private void FilterServers(string query)
+        {
+            cboServerDropdown.Items.Clear();
+            foreach (string server in cachedServerFolders)
+            {
+                if (string.IsNullOrWhiteSpace(query) || server.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    cboServerDropdown.Items.Add(server);
+                }
+            }
+        }
+
+        private void LoadSelectedServerPaks()
+        {
+            try
+            {
+                cachedServerPaks.Clear();
+                string serverName = (cboServerDropdown.SelectedItem != null) ? cboServerDropdown.SelectedItem.ToString() : null;
+
+                if (!string.IsNullOrEmpty(serverName))
+                {
+                    string targetDir = Path.Combine(serverStorageDir, serverName);
+                    if (Directory.Exists(targetDir))
+                    {
+                        foreach (string file in Directory.GetFiles(targetDir, "*.pak"))
+                        {
+                            cachedServerPaks.Add(Path.GetFileName(file));
+                        }
+                    }
+                }
+
+                FilterMods(txtModSearchBox.Text);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Listing Mod Files for Selected Server", ex);
+            }
+        }
+
+        private void OnModSearchChanged(object sender, EventArgs e)
+        {
+            FilterMods(txtModSearchBox.Text);
+        }
+
+        private void FilterMods(string query)
+        {
+            lstServerPaks.Items.Clear();
+            foreach (string pak in cachedServerPaks)
+            {
+                if (string.IsNullOrWhiteSpace(query) || pak.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    lstServerPaks.Items.Add(pak);
+                }
+            }
+        }
+
+        private void OnAddServerClicked(object sender, EventArgs e)
+        {
+            string name = Interaction.InputBox("Enter the new server folder name:", "Add Server", "");
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                try
+                {
+                    string trimmedName = name.Trim();
+                    if (trimmedName.Equals("Backup_Vanilla", StringComparison.OrdinalIgnoreCase) ||
+                        trimmedName.Equals("Backup_Saves", StringComparison.OrdinalIgnoreCase) ||
+                        trimmedName.Equals("Backup_CharacterSaves", StringComparison.OrdinalIgnoreCase))
+                    {
+                        MessageBox.Show("That name is reserved for system backups.", "Invalid Name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    Directory.CreateDirectory(Path.Combine(serverStorageDir, trimmedName));
+                    txtServerSearchBox.Text = "";
+                    RefreshServerList();
+                    cboServerDropdown.SelectedItem = trimmedName;
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Creating New Server Folder", ex);
+                }
+            }
+        }
+
+        private void OnDeleteServerClicked(object sender, EventArgs e)
+        {
+            string serverName = (cboServerDropdown.SelectedItem != null) ? cboServerDropdown.SelectedItem.ToString() : "";
+            if (string.IsNullOrEmpty(serverName))
+            {
+                MessageBox.Show("Please select a server folder to delete.", "Notice");
+                return;
+            }
+
+            string serverDirPath = Path.Combine(serverStorageDir, serverName);
+
+            if (MessageBox.Show("Are you sure you want to delete the entire server folder '" + serverName + "' and all its stored mod paks?", "Confirm Delete Server", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+            {
+                try
+                {
+                    if (Directory.Exists(serverDirPath))
+                    {
+                        Directory.Delete(serverDirPath, true);
+                        RefreshServerList();
+                        MessageBox.Show("Successfully deleted server folder '" + serverName + "'.", "Success");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Deleting Server Folder", ex);
+                }
+            }
+        }
+
+        private void OnDeleteModClicked(object sender, EventArgs e)
+        {
+            if (lstServerPaks.SelectedItem == null)
+            {
+                MessageBox.Show("Please select a .pak file from the list to delete.", "Notice");
+                return;
+            }
+
+            string serverName = (cboServerDropdown.SelectedItem != null) ? cboServerDropdown.SelectedItem.ToString() : "";
+            string fileName = lstServerPaks.SelectedItem.ToString();
+            string filePath = Path.Combine(serverStorageDir, serverName, fileName);
+
+            if (MessageBox.Show("Are you sure you want to delete '" + fileName + "'?", "Confirm Delete", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+            {
+                try
+                {
+                    if (File.Exists(filePath))
+                    {
+                        File.Delete(filePath);
+                        LoadSelectedServerPaks();
+                        MessageBox.Show("Successfully deleted '" + fileName + "'.", "Success");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Deleting Selected Mod File", ex);
+                }
+            }
+        }
+
+        private void OnMergeServerModsClicked(object sender, EventArgs e)
+        {
+            if (cachedServerFolders.Count < 2)
+            {
+                MessageBox.Show("You need at least two server folders to perform a merge.", "Insufficient Servers", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            Form mergeForm = new Form
+            {
+                Text = "Merge Server Mods",
+                Width = 720,
+                Height = 560,
+                StartPosition = FormStartPosition.CenterParent,
+                MinimizeBox = false,
+                MaximizeBox = false
+            };
+
+            Label lblServer1 = new Label { Text = "First Server:", Location = new Point(15, 15), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            ComboBox cboServer1 = new ComboBox { Location = new Point(105, 12), Width = 210, DropDownStyle = ComboBoxStyle.DropDownList };
+            
+            Label lblServer2 = new Label { Text = "Second Server:", Location = new Point(340, 15), AutoSize = true, Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold) };
+            ComboBox cboServer2 = new ComboBox { Location = new Point(460, 12), Width = 210, DropDownStyle = ComboBoxStyle.DropDownList };
+
+            foreach (string s in cachedServerFolders)
+            {
+                cboServer1.Items.Add(s);
+                cboServer2.Items.Add(s);
+            }
+
+            if (cboServer1.Items.Count > 0) cboServer1.SelectedIndex = 0;
+            if (cboServer2.Items.Count > 1) cboServer2.SelectedIndex = 1;
+            else if (cboServer2.Items.Count > 0) cboServer2.SelectedIndex = 0;
+
+            CheckedListBox chkListLeft = new CheckedListBox { Location = new Point(15, 50), Size = new Size(320, 380), CheckOnClick = true, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left };
+            CheckedListBox chkListRight = new CheckedListBox { Location = new Point(365, 50), Size = new Size(320, 380), CheckOnClick = true, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Right };
+
+            Action loadLeftPaks = delegate
+            {
+                chkListLeft.Items.Clear();
+                string sName = cboServer1.SelectedItem as string;
+                if (!string.IsNullOrEmpty(sName))
+                {
+                    string dir = Path.Combine(serverStorageDir, sName);
+                    if (Directory.Exists(dir))
+                    {
+                        foreach (string f in Directory.GetFiles(dir, "*.pak"))
+                        {
+                            chkListLeft.Items.Add(Path.GetFileName(f), true);
+                        }
+                    }
+                }
+            };
+
+            Action loadRightPaks = delegate
+            {
+                chkListRight.Items.Clear();
+                string sName = cboServer2.SelectedItem as string;
+                if (!string.IsNullOrEmpty(sName))
+                {
+                    string dir = Path.Combine(serverStorageDir, sName);
+                    if (Directory.Exists(dir))
+                    {
+                        foreach (string f in Directory.GetFiles(dir, "*.pak"))
+                        {
+                            chkListRight.Items.Add(Path.GetFileName(f), true);
+                        }
+                    }
+                }
+            };
+
+            cboServer1.SelectedIndexChanged += delegate { loadLeftPaks(); };
+            cboServer2.SelectedIndexChanged += delegate { loadRightPaks(); };
+
+            loadLeftPaks();
+            loadRightPaks();
+
+            Button btnExecuteMerge = new ShinyButton
+            {
+                Text = "Execute Merge/Create New Server",
+                Location = new Point(15, 450),
+                Width = 670,
+                Height = 36,
+                FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                Font = new Font(FontFamily.GenericSansSerif, 9.5f, FontStyle.Bold)
+            };
+
+            btnExecuteMerge.Click += delegate
+            {
+                string newServerName = Interaction.InputBox("Enter name for the new merged server folder:", "New Server Name", "MergedServer");
+                if (string.IsNullOrWhiteSpace(newServerName)) return;
+
+                string trimmedName = newServerName.Trim();
+                if (trimmedName.Equals("Backup_Vanilla", StringComparison.OrdinalIgnoreCase) ||
+                    trimmedName.Equals("Backup_Saves", StringComparison.OrdinalIgnoreCase) ||
+                    trimmedName.Equals("Backup_CharacterSaves", StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show("That name is reserved for system backups.", "Invalid Name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string newServerDirPath = Path.Combine(serverStorageDir, trimmedName);
+                if (Directory.Exists(newServerDirPath))
+                {
+                    MessageBox.Show("A server folder with that name already exists.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                try
+                {
+                    Directory.CreateDirectory(newServerDirPath);
+                    Dictionary<string, string> uniqueMods = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                    string s1Dir = Path.Combine(serverStorageDir, cboServer1.SelectedItem.ToString());
+                    foreach (var item in chkListLeft.CheckedItems)
+                    {
+                        string fileName = item.ToString();
+                        string sourcePath = Path.Combine(s1Dir, fileName);
+                        string baseName = ExtractBaseModName(fileName);
+
+                        if (uniqueMods.ContainsKey(baseName))
+                        {
+                            string existingPath = uniqueMods[baseName];
+                            DateTime existingDate = File.GetLastWriteTimeUtc(existingPath);
+                            DateTime incomingDate = File.GetLastWriteTimeUtc(sourcePath);
+                            if (incomingDate > existingDate)
+                            {
+                                uniqueMods[baseName] = sourcePath;
+                            }
+                        }
+                        else
+                        {
+                            uniqueMods[baseName] = sourcePath;
+                        }
+                    }
+
+                    string s2Dir = Path.Combine(serverStorageDir, cboServer2.SelectedItem.ToString());
+                    foreach (var item in chkListRight.CheckedItems)
+                    {
+                        string fileName = item.ToString();
+                        string sourcePath = Path.Combine(s2Dir, fileName);
+                        string baseName = ExtractBaseModName(fileName);
+
+                        if (uniqueMods.ContainsKey(baseName))
+                        {
+                            string existingPath = uniqueMods[baseName];
+                            DateTime existingDate = File.GetLastWriteTimeUtc(existingPath);
+                            DateTime incomingDate = File.GetLastWriteTimeUtc(sourcePath);
+                            if (incomingDate > existingDate)
+                            {
+                                uniqueMods[baseName] = sourcePath;
+                            }
+                        }
+                        else
+                        {
+                            uniqueMods[baseName] = sourcePath;
+                        }
+                    }
+
+                    int copiedCount = 0;
+                    foreach (var kvp in uniqueMods)
+                    {
+                        string src = kvp.Value;
+                        string dest = Path.Combine(newServerDirPath, Path.GetFileName(src));
+                        File.Copy(src, dest, true);
+                        copiedCount++;
+                    }
+
+                    RefreshServerList();
+                    cboServerDropdown.SelectedItem = trimmedName;
+                    mergeForm.Close();
+                    MessageBox.Show("Successfully created merged server '" + trimmedName + "' with " + copiedCount + " unique/updated mod(s).", "Merge Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Merging Server Mods", ex);
+                }
+            };
+
+            mergeForm.Controls.Add(lblServer1);
+            mergeForm.Controls.Add(cboServer1);
+            mergeForm.Controls.Add(lblServer2);
+            mergeForm.Controls.Add(cboServer2);
+            mergeForm.Controls.Add(chkListLeft);
+            mergeForm.Controls.Add(chkListRight);
+            mergeForm.Controls.Add(btnExecuteMerge);
+
+            ApplyDialogTheme(mergeForm);
+            mergeForm.ShowDialog(this);
+        }
+
+        private string ExtractBaseModName(string filename)
+        {
+            string name = Path.GetFileNameWithoutExtension(filename);
+
+            if (name.EndsWith("_P", StringComparison.OrdinalIgnoreCase))
+            {
+                name = name.Substring(0, name.Length - 2);
+            }
+
+            name = Regex.Replace(name, @"^[zZ]+_?", "", RegexOptions.IgnoreCase);
+            name = Regex.Replace(name, @"[_\-\.]?v?\d+[\d\.\-T_r]*$", "", RegexOptions.IgnoreCase);
+
+            return name.ToLower().Trim();
+        }
+
+        private bool IsReadmeFile(string fileName)
+        {
+            string fileNameOnly = Path.GetFileName(fileName);
+            return Regex.IsMatch(fileNameOnly, @"^.*read.*m*e*.*\.(txt|md|rtf|log)$", RegexOptions.IgnoreCase) || 
+                   Regex.IsMatch(fileNameOnly, @"^readme.*$", RegexOptions.IgnoreCase);
+        }
+
+        private void OnPanelDragEnter(object sender, DragEventArgs e)
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop) || 
+                e.Data.GetDataPresent("FileGroupDescriptorW"))
+            {
+                e.Effect = DragDropEffects.Copy;
+                ShowDragOverlay();
+            }
+            else
+            {
+                e.Effect = DragDropEffects.None;
+            }
+        }
+
+        private void AnyControl_DragLeave(object sender, EventArgs e)
+        {
+            // Debounced: moving from one child control to another fires DragLeave on the first
+            // immediately followed by DragEnter on the second within the same message pump, so
+            // delay the hide briefly and let a fresh DragEnter cancel it - avoids overlay flicker
+            // while dragging across the window instead of only truly leaving it.
+            dragLeaveTimer.Stop();
+            dragLeaveTimer.Start();
+        }
+
+        private void ShowDragOverlay()
+        {
+            dragLeaveTimer.Stop();
+            if (!pnlDragOverlay.Visible)
+            {
+                pnlDragOverlay.Visible = true;
+                pnlDragOverlay.BringToFront();
+            }
+            Opacity = 0.88;
+        }
+
+        private void HideDragOverlay()
+        {
+            pnlDragOverlay.Visible = false;
+            Opacity = 1.0;
+        }
+
+        private void OnPanelDragDrop(object sender, DragEventArgs e)
+        {
+            dragLeaveTimer.Stop();
+            HideDragOverlay();
+
+            string serverName = (cboServerDropdown.SelectedItem != null) ? cboServerDropdown.SelectedItem.ToString() : null;
+
+            if (string.IsNullOrEmpty(serverName))
+            {
+                serverName = Interaction.InputBox("Enter target server name for these files:", "New Server", "");
+                if (string.IsNullOrWhiteSpace(serverName)) return;
+
+                try
+                {
+                    string trimmedName = serverName.Trim();
+                    if (trimmedName.Equals("Backup_Vanilla", StringComparison.OrdinalIgnoreCase) ||
+                        trimmedName.Equals("Backup_Saves", StringComparison.OrdinalIgnoreCase) ||
+                        trimmedName.Equals("Backup_CharacterSaves", StringComparison.OrdinalIgnoreCase))
+                    {
+                        MessageBox.Show("That name is reserved for system backups.", "Invalid Name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    Directory.CreateDirectory(Path.Combine(serverStorageDir, trimmedName));
+                    txtServerSearchBox.Text = "";
+                    RefreshServerList();
+                    cboServerDropdown.SelectedItem = trimmedName;
+                    serverName = trimmedName;
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Creating Target Server Directory", ex);
+                    return;
+                }
+            }
+
+            string targetServerPath = Path.Combine(serverStorageDir, serverName);
+            int processedCount = 0;
+            string tempExtractDir = Path.Combine(Path.GetTempPath(), "MotorTownModManager_" + Guid.NewGuid().ToString("N"));
+
+            try
+            {
+                List<string> filesToProcess = new List<string>();
+
+                // Handle Standard Physical File Drops (.zip, .pak, loose files) - checked first.
+                // Explorer commonly advertises "FileGroupDescriptorW" even for ordinary files
+                // dragged straight off disk, not just genuine virtual sources (e.g. dragging
+                // out of an open zip-preview window). If we checked that format first, real
+                // file drops would get routed into the virtual-stream path, which can't
+                // retrieve their actual content - so nothing gets imported. Checking FileDrop
+                // first ensures normal drags are handled the reliable, direct way.
+                if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    string[] paths = (string[])e.Data.GetData(DataFormats.FileDrop);
+
+                    foreach (string path in paths)
+                    {
+                        if (File.Exists(path))
+                        {
+                            string fileName = Path.GetFileName(path);
+                            string ext = Path.GetExtension(path);
+
+                            if (ext.Equals(".pak", StringComparison.OrdinalIgnoreCase))
+                            {
+                                filesToProcess.Add(path);
+                            }
+                            else if (IsReadmeFile(fileName))
+                            {
+                                try
+                                {
+                                    ShowReadmeWindow(fileName, File.ReadAllText(path));
+                                }
+                                catch (Exception ex)
+                                {
+                                    ShowError("Reading Loose Readme File '" + fileName + "'", ex);
+                                }
+                            }
+                            else if (ext.Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                            {
+                                try
+                                {
+                                    Directory.CreateDirectory(tempExtractDir);
+                                    SafeExtractZip(path, tempExtractDir);
+
+                                    foreach (string extractedFile in Directory.GetFiles(tempExtractDir, "*", SearchOption.AllDirectories))
+                                    {
+                                        string extractedFileName = Path.GetFileName(extractedFile);
+                                        string extractedExt = Path.GetExtension(extractedFile);
+
+                                        if (IsReadmeFile(extractedFileName))
+                                        {
+                                            try { ShowReadmeWindow(extractedFileName, File.ReadAllText(extractedFile)); } catch { }
+                                        }
+                                        else if (extractedFileName.Equals("Engine.ini", StringComparison.OrdinalIgnoreCase) && chkAutoEngineIni.Checked)
+                                        {
+                                            ProcessEngineIni(extractedFile);
+                                        }
+                                        else if (extractedExt.Equals(".pak", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            if (!filesToProcess.Contains(extractedFile))
+                                            {
+                                                filesToProcess.Add(extractedFile);
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    ShowError("Extracting Zip Archive '" + Path.GetFileName(path) + "'", ex);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Handle Virtual File Stream Drops (dragging files directly out of an open Zip
+                // window) - only reached when this isn't a normal physical file drop.
+                else if (e.Data.GetDataPresent("FileGroupDescriptorW") && e.Data.GetDataPresent("FileContents"))
+                {
+                    Directory.CreateDirectory(tempExtractDir);
+                    Stream stream = (Stream)e.Data.GetData("FileGroupDescriptorW");
+                    if (stream != null)
+                    {
+                        byte[] buffer = new byte[stream.Length];
+                        stream.Read(buffer, 0, buffer.Length);
+
+                        int fileCount = BitConverter.ToInt32(buffer, 0);
+                        int offset = 4;
+
+                        for (int i = 0; i < fileCount; i++)
+                        {
+                            string fileName = System.Text.Encoding.Unicode.GetString(buffer, offset + 76, 520).TrimEnd('\0');
+                            offset += 592; // Size of FILEDESCRIPTORW structure
+
+                            byte[] fileBytes = GetVirtualFileContents(e.Data, i);
+                            if (fileBytes != null)
+                            {
+                                string extractedFilePath = SafeCombineWithinDirectory(tempExtractDir, fileName);
+                                if (extractedFilePath == null)
+                                {
+                                    continue; // suspicious/unsafe name in virtual drop data - skip it
+                                }
+                                File.WriteAllBytes(extractedFilePath, fileBytes);
+
+                                string ext = Path.GetExtension(extractedFilePath);
+                                if (ext.Equals(".pak", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    filesToProcess.Add(extractedFilePath);
+                                }
+                                else if (IsReadmeFile(fileName))
+                                {
+                                    try { ShowReadmeWindow(fileName, File.ReadAllText(extractedFilePath)); } catch { }
+                                }
+                                else if (ext.Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        string innerExtractDir = Path.Combine(tempExtractDir, "inner_" + Guid.NewGuid().ToString("N"));
+                                        Directory.CreateDirectory(innerExtractDir);
+                                        SafeExtractZip(extractedFilePath, innerExtractDir);
+
+                                        foreach (string extractedFile in Directory.GetFiles(innerExtractDir, "*", SearchOption.AllDirectories))
+                                        {
+                                            string innerFileName = Path.GetFileName(extractedFile);
+                                            string innerExt = Path.GetExtension(extractedFile);
+
+                                            if (IsReadmeFile(innerFileName))
+                                            {
+                                                try { ShowReadmeWindow(innerFileName, File.ReadAllText(extractedFile)); } catch { }
+                                            }
+                                            else if (innerFileName.Equals("Engine.ini", StringComparison.OrdinalIgnoreCase) && chkAutoEngineIni.Checked)
+                                            {
+                                                ProcessEngineIni(extractedFile);
+                                            }
+                                            else if (innerExt.Equals(".pak", StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                if (!filesToProcess.Contains(extractedFile))
+                                                {
+                                                    filesToProcess.Add(extractedFile);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        ShowError("Extracting Dropped Zip Archive '" + fileName + "'", ex);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                foreach (string file in filesToProcess)
+                {
+                    try
+                    {
+                        string incomingFileName = Path.GetFileName(file);
+
+                        if (incomingFileName.Equals("MotorTown-Windows.pak", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        if (!chkSmartMatching.Checked)
+                        {
+                            File.Copy(file, Path.Combine(targetServerPath, incomingFileName), true);
+                            processedCount++;
+                            continue;
+                        }
+
+                        string incomingBaseName = ExtractBaseModName(incomingFileName);
+                        string[] existingFiles = Directory.GetFiles(targetServerPath, "*.pak");
+                        string matchPath = null;
+
+                        foreach (string existing in existingFiles)
+                        {
+                            if (ExtractBaseModName(Path.GetFileName(existing)) == incomingBaseName)
+                            {
+                                matchPath = existing;
+                                break;
+                            }
+                        }
+
+                        if (matchPath != null)
+                        {
+                            string existingFileName = Path.GetFileName(matchPath);
+
+                            if (existingFileName.Equals(incomingFileName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                File.Copy(file, Path.Combine(targetServerPath, incomingFileName), true);
+                                processedCount++;
+                            }
+                            else
+                            {
+                                DateTime existingDate = File.GetLastWriteTimeUtc(matchPath);
+                                DateTime incomingDate = File.GetLastWriteTimeUtc(file);
+
+                                string comparisonNote = incomingDate > existingDate
+                                    ? "• NEW file is newer (Modified: " + incomingDate.ToLocalTime() + ")\n  than existing file (Modified: " + existingDate.ToLocalTime() + ")"
+                                    : "• NEW file is older or same (Modified: " + incomingDate.ToLocalTime() + ")\n  than existing file (Modified: " + existingDate.ToLocalTime() + ")";
+
+                                string prompt = "Existing version of this mod detected:\n\n" +
+                                                "Existing: " + existingFileName + "\n" +
+                                                "Incoming: " + incomingFileName + "\n\n" +
+                                                "File Properties:\n" + comparisonNote + "\n\n" +
+                                                "Replace old version with the new one?";
+
+                                if (MessageBox.Show(prompt, "Version Conflict Detected", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                                {
+                                    File.Delete(matchPath);
+                                    File.Copy(file, Path.Combine(targetServerPath, incomingFileName), true);
+                                    processedCount++;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            File.Copy(file, Path.Combine(targetServerPath, incomingFileName), true);
+                            processedCount++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ShowError("Processing File '" + Path.GetFileName(file) + "'", ex);
+                    }
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(tempExtractDir))
+                        Directory.Delete(tempExtractDir, true);
+                }
+                catch { }
+            }
+
+            LoadSelectedServerPaks();
+            if (processedCount > 0)
+            {
+                MessageBox.Show("Successfully processed " + processedCount + " .pak file(s) for server '" + serverName + "'.", "Success");
+            }
+        }
+
+        private void ShowReadmeWindow(string title, string content)
+        {
+            Form readmeForm = new Form
+            {
+                Text = "Mod Instructions - " + title,
+                Width = 500,
+                Height = 450,
+                StartPosition = FormStartPosition.CenterParent,
+                MinimizeBox = false,
+                MaximizeBox = false
+            };
+
+            TextBox txtContent = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Dock = DockStyle.Fill,
+                Text = content,
+                Font = new Font(FontFamily.GenericMonospace, 9.5f)
+            };
+
+            Button btnOk = new ShinyButton
+            {
+                Text = "OK (Press Enter)",
+                Dock = DockStyle.Bottom,
+                Height = 35,
+                DialogResult = DialogResult.OK
+            };
+            btnOk.Click += delegate(object s, EventArgs e) { readmeForm.Close(); };
+
+            readmeForm.Controls.Add(txtContent);
+            readmeForm.Controls.Add(btnOk);
+            readmeForm.AcceptButton = btnOk;
+
+            ApplyDialogTheme(readmeForm);
+            readmeForm.ShowDialog(this);
+        }
+
+        private void ProcessEngineIni(string newIniPath)
+        {
+            try
+            {
+                string targetEngineIniPath;
+                if (!EnsureEngineIniExists(out targetEngineIniPath))
+                {
+                    return;
+                }
+
+                string targetIniDir = Path.GetDirectoryName(targetEngineIniPath);
+                if (!string.IsNullOrEmpty(targetIniDir) && !Directory.Exists(targetIniDir))
+                {
+                    Directory.CreateDirectory(targetIniDir);
+                }
+
+                if (File.Exists(targetEngineIniPath))
+                {
+                    File.SetAttributes(targetEngineIniPath, FileAttributes.Normal);
+                }
+
+                Dictionary<string, string> existingSettings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                List<string> existingLines = new List<string>();
+
+                if (File.Exists(targetEngineIniPath))
+                {
+                    existingLines = new List<string>(File.ReadAllLines(targetEngineIniPath));
+                    foreach (string line in existingLines)
+                    {
+                        string trimmed = line.Trim();
+                        if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith(";") && !trimmed.StartsWith("#") && trimmed.Contains("="))
+                        {
+                            int idx = trimmed.IndexOf('=');
+                            string key = trimmed.Substring(0, idx).Trim();
+                            string val = trimmed.Substring(idx + 1).Trim();
+                            existingSettings[key] = val;
+                        }
+                    }
+                }
+
+                Dictionary<string, string> incomingSettings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                List<string> incomingLines = new List<string>(File.ReadAllLines(newIniPath));
+                foreach (string line in incomingLines)
+                {
+                    string trimmed = line.Trim();
+                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith(";") && !trimmed.StartsWith("#") && trimmed.Contains("="))
+                    {
+                        int idx = trimmed.IndexOf('=');
+                        string key = trimmed.Substring(0, idx).Trim();
+                        string val = trimmed.Substring(idx + 1).Trim();
+                        incomingSettings[key] = val;
+                    }
+                }
+
+                List<string> mergedLines = new List<string>(existingLines);
+                System.Text.StringBuilder comparisonLog = new System.Text.StringBuilder();
+                comparisonLog.AppendLine("Engine.ini Smart Merge Analysis:\n");
+
+                foreach (var kvp in incomingSettings)
+                {
+                    string key = kvp.Key;
+                    string incomingValStr = kvp.Value;
+
+                    if (existingSettings.ContainsKey(key))
+                    {
+                        string existingValStr = existingSettings[key];
+
+                        if (key.IndexOf("winch", StringComparison.OrdinalIgnoreCase) >= 0 || 
+                            key.IndexOf("length", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            key.IndexOf("rope", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            float incNum, extNum;
+                            if (float.TryParse(incomingValStr, out incNum) && float.TryParse(existingValStr, out extNum))
+                            {
+                                if (incNum > extNum)
+                                {
+                                    comparisonLog.AppendLine("[WINCH / LENGTH] " + key + ":\n  Existing: " + existingValStr + "\n  Incoming: " + incomingValStr + "\n  -> Updated to larger value (" + incomingValStr + ")\n");
+                                    UpdateOrCreateLine(mergedLines, key, incomingValStr);
+                                }
+                                else
+                                {
+                                    comparisonLog.AppendLine("[WINCH / LENGTH] " + key + ":\n  Existing: " + existingValStr + "\n  Incoming: " + incomingValStr + "\n  -> Kept larger existing value (" + existingValStr + ")\n");
+                                }
+                                continue;
+                            }
+                        }
+
+                        if (existingValStr != incomingValStr)
+                        {
+                            comparisonLog.AppendLine("[MODIFIED] " + key + ":\n  Existing: " + existingValStr + "\n  Incoming: " + incomingValStr + "\n");
+                            UpdateOrCreateLine(mergedLines, key, incomingValStr);
+                        }
+                    }
+                    else
+                    {
+                        comparisonLog.AppendLine("[NEW] " + key + " = " + incomingValStr + "\n");
+                        mergedLines.Add(key + "=" + incomingValStr);
+                    }
+                }
+
+                Form diffForm = new Form
+                {
+                    Text = "Engine.ini Changes Approval",
+                    Width = 550,
+                    Height = 480,
+                    StartPosition = FormStartPosition.CenterParent,
+                    MinimizeBox = false,
+                    MaximizeBox = false
+                };
+
+                Label lblHeader = new Label
+                {
+                    Text = "A mod included an Engine.ini file. Review proposed changes below:",
+                    Dock = DockStyle.Top,
+                    Height = 25,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold)
+                };
+
+                TextBox txtDiff = new TextBox
+                {
+                    Multiline = true,
+                    ReadOnly = true,
+                    ScrollBars = ScrollBars.Vertical,
+                    Dock = DockStyle.Fill,
+                    Text = comparisonLog.ToString(),
+                    Font = new Font(FontFamily.GenericMonospace, 9)
+                };
+
+                Panel pnlButtons = new Panel { Dock = DockStyle.Bottom, Height = 40 };
+                Button btnApprove = new ShinyButton { Text = "Approve Edits", DialogResult = DialogResult.Yes, Width = 150, Height = 30, Location = new Point(105, 5) };
+                Button btnCancel = new ShinyButton { Text = "Skip Edits", DialogResult = DialogResult.No, Width = 150, Height = 30, Location = new Point(285, 5) };
+
+                pnlButtons.Controls.Add(btnApprove);
+                pnlButtons.Controls.Add(btnCancel);
+
+                diffForm.Controls.Add(txtDiff);
+                diffForm.Controls.Add(lblHeader);
+                diffForm.Controls.Add(pnlButtons);
+                diffForm.AcceptButton = btnApprove;
+                diffForm.CancelButton = btnCancel;
+
+                ApplyDialogTheme(diffForm);
+                if (diffForm.ShowDialog(this) == DialogResult.Yes)
+                {
+                    File.WriteAllLines(targetEngineIniPath, mergedLines);
+                    File.SetAttributes(targetEngineIniPath, FileAttributes.ReadOnly);
+
+                    MessageBox.Show("Engine.ini successfully updated, merged, and locked as Read-Only.", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    if (File.Exists(targetEngineIniPath))
+                    {
+                        File.SetAttributes(targetEngineIniPath, FileAttributes.ReadOnly);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ShowError("Processing Engine.ini Configuration", ex);
+            }
+        }
+
+        private void UpdateOrCreateLine(List<string> lines, string key, string newValue)
+        {
+            bool found = false;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string trimmed = lines[i].Trim();
+                if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith(";") && trimmed.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                {
+                    int idx = trimmed.IndexOf('=');
+                    if (idx != -1 && trimmed.Substring(0, idx).Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        lines[i] = key + "=" + newValue;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found)
+            {
+                lines.Add(key + "=" + newValue);
+            }
+        }
+
+        private void OnOpenEngineIniClicked(object sender, EventArgs e)
+        {
+            string targetEngineIniPath;
+            if (!EnsureEngineIniExists(out targetEngineIniPath))
+            {
+                return;
+            }
+
+            try
+            {
+                string targetIniDir = Path.GetDirectoryName(targetEngineIniPath);
+                if (!string.IsNullOrEmpty(targetIniDir) && !Directory.Exists(targetIniDir))
+                {
+                    Directory.CreateDirectory(targetIniDir);
+                }
+
+                if (File.Exists(targetEngineIniPath))
+                {
+                    File.SetAttributes(targetEngineIniPath, FileAttributes.Normal);
+                }
+                else
+                {
+                    File.WriteAllText(targetEngineIniPath, "; Motor Town Engine.ini Config\n");
+                }
+
+                string selectedEditor = (cboEditorSelector.SelectedItem != null) ? cboEditorSelector.SelectedItem.ToString() : "Windows Notepad";
+                
+                if (selectedEditor.Equals("Notepad++", StringComparison.OrdinalIgnoreCase))
+                {
+                    string nppPath = @"C:\Program Files\Notepad++\notepad++.exe";
+                    if (!File.Exists(nppPath)) nppPath = @"C:\Program Files (x86)\Notepad++\notepad++.exe";
+                    
+                    if (File.Exists(nppPath))
+                    {
+                        Process.Start(nppPath, "\"" + targetEngineIniPath + "\"");
+                    }
+                    else
+                    {
+                        MessageBox.Show("Notepad++ executable could not be found in standard paths. Falling back to Windows Notepad.", "Editor Not Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        Process.Start("notepad.exe", targetEngineIniPath);
+                    }
+                }
+                else if (selectedEditor.Equals("VS Code", StringComparison.OrdinalIgnoreCase))
+                {
+                    string codePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\Microsoft VS Code\Code.exe");
+                    if (!File.Exists(codePath)) codePath = @"C:\Program Files\Microsoft VS Code\Code.exe";
+
+                    if (File.Exists(codePath))
+                    {
+                        Process.Start(codePath, "\"" + targetEngineIniPath + "\"");
+                    }
+                    else
+                    {
+                        MessageBox.Show("VS Code executable could not be found in standard paths. Falling back to Windows Notepad.", "Editor Not Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        Process.Start("notepad.exe", targetEngineIniPath);
+                    }
+                }
+                else
+                {
+                    Process.Start("notepad.exe", targetEngineIniPath);
+                }
+                
+                MessageBox.Show("Engine.ini has been unlocked for editing.\n\nClick OK once you are finished editing to lock it back to Read-Only automatically.", "Engine.ini Unlocked", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Opening Engine.ini", ex);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(targetEngineIniPath))
+                    {
+                        File.SetAttributes(targetEngineIniPath, FileAttributes.ReadOnly);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private void OnDeployModsClicked(object sender, EventArgs e)
+        {
+            string serverName = (cboServerDropdown.SelectedItem != null) ? cboServerDropdown.SelectedItem.ToString() : null;
+            string gamePath = txtGamePath.Text;
+
+            if (string.IsNullOrEmpty(serverName))
+            {
+                MessageBox.Show("Please select or create a server first.", "Error");
+                return;
+            }
+
+            if (!Directory.Exists(gamePath))
+            {
+                MessageBox.Show("Target game directory does not exist.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (MessageBox.Show("This will clear out existing mod paks in your game folder and deploy '" + serverName + "' mods.\n\nProceed?", "Deploy Mods", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            try
+            {
+                foreach (string pak in Directory.GetFiles(gamePath, "*.pak"))
+                {
+                    if (!Path.GetFileName(pak).Equals("MotorTown-Windows.pak", StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(pak);
+                    }
+                }
+
+                string sourceDir = Path.Combine(serverStorageDir, serverName);
+                int deployedCount = 0;
+
+                foreach (string pak in Directory.GetFiles(sourceDir, "*.pak"))
+                {
+                    File.Copy(pak, Path.Combine(gamePath, Path.GetFileName(pak)), true);
+                    deployedCount++;
+                }
+
+                MessageBox.Show("Successfully deployed " + deployedCount + " mod file(s) from server '" + serverName + "'.", "Success");
+            }
+            catch (Exception ex)
+            {
+                ShowError("Deploying Mods to Game Directory", ex);
+            }
+        }
+
+        private void OnRevertVanillaClicked(object sender, EventArgs e)
+        {
+            string gamePath = txtGamePath.Text;
+
+            if (!Directory.Exists(gamePath))
+            {
+                MessageBox.Show("Target game directory does not exist.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (MessageBox.Show("This will remove all installed mods from your game folder and restore vanilla configuration.\n\nProceed?", "Revert to Vanilla", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            try
+            {
+                int removedCount = 0;
+                foreach (string pak in Directory.GetFiles(gamePath, "*.pak"))
+                {
+                    if (!Path.GetFileName(pak).Equals("MotorTown-Windows.pak", StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(pak);
+                        removedCount++;
+                    }
+                }
+
+                MessageBox.Show("Successfully removed " + removedCount + " mod file(s). Game restored to clean vanilla state.", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Removing Mods from Game Directory", ex);
+            }
+        }
+
+        private async void OnBackupPaksClicked(object sender, EventArgs e)
+        {
+            string gamePath = txtGamePath.Text;
+
+            if (!Directory.Exists(gamePath))
+            {
+                MessageBox.Show("Target game directory does not exist.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string sourceFile = Path.Combine(gamePath, "MotorTown-Windows.pak");
+
+            if (!File.Exists(sourceFile))
+            {
+                MessageBox.Show("Could not find 'MotorTown-Windows.pak' in the target game directory.", "Backup Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            ShowBusyOverlay("Backing up MotorTown-Windows.pak...");
+            try
+            {
+                if (!Directory.Exists(backupStorageDir))
+                    Directory.CreateDirectory(backupStorageDir);
+
+                string destFile = Path.Combine(backupStorageDir, "MotorTown-Windows.pak");
+
+                // This file is large enough that a synchronous File.Copy on the UI thread
+                // would freeze the whole window for the duration - running it on a
+                // background thread keeps the app responsive while the overlay spins.
+                await Task.Run(delegate { File.Copy(sourceFile, destFile, true); });
+
+                MessageBox.Show("Successfully backed up 'MotorTown-Windows.pak' to 'ServerMods\\Backup_Vanilla'.", "Backup Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Backing Up Game Pak", ex);
+            }
+            finally
+            {
+                HideBusyOverlay();
+            }
+        }
+
+        private async void OnRestoreBackupClicked(object sender, EventArgs e)
+        {
+            string gamePath = txtGamePath.Text;
+
+            if (!Directory.Exists(gamePath))
+            {
+                MessageBox.Show("Target game directory does not exist.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string sourceBackupFile = Path.Combine(backupStorageDir, "MotorTown-Windows.pak");
+
+            if (!File.Exists(sourceBackupFile))
+            {
+                MessageBox.Show("No backup file found for 'MotorTown-Windows.pak' inside 'ServerMods\\Backup_Vanilla'. Please run 'Backup Main Game File' first.", "No Backup Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (MessageBox.Show("This will overwrite your current game core package ('MotorTown-Windows.pak') with your saved backup version. Proceed?", "Restore Backup", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            ShowBusyOverlay("Restoring MotorTown-Windows.pak...");
+            try
+            {
+                string destFile = Path.Combine(gamePath, "MotorTown-Windows.pak");
+                await Task.Run(delegate { File.Copy(sourceBackupFile, destFile, true); });
+
+                MessageBox.Show("Successfully restored 'MotorTown-Windows.pak' from backup.", "Restore Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ShowError("Restoring Game Pak from Backup", ex);
+            }
+            finally
+            {
+                HideBusyOverlay();
+            }
+        }
+
+        private void OnBackupSavesClicked(object sender, EventArgs e)
+        {
+            string charactersDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"MotorTown\Saved\SaveGames\Characters");
+
+            if (!Directory.Exists(charactersDir))
+            {
+                ShowThemedMessage("Backup Failed", "Characters save directory could not be found at:\n" + charactersDir);
+                return;
+            }
+
+            try
+            {
+                if (!Directory.Exists(saveGameBackupDir))
+                    Directory.CreateDirectory(saveGameBackupDir);
+
+                string[] saveFiles = Directory.GetFiles(charactersDir, "*.sav");
+                int backedUpCount = 0;
+
+                foreach (string file in saveFiles)
+                {
+                    string fileName = Path.GetFileName(file);
+                    if (Regex.IsMatch(fileName, @"backup\d+", RegexOptions.IgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string destFile = Path.Combine(saveGameBackupDir, fileName);
+                    File.Copy(file, destFile, true);
+                    backedUpCount++;
+                }
+
+                ShowThemedMessage("Backup Complete", "Successfully backed up " + backedUpCount + " character save file(s) to 'ServerMods\\Backup_Saves'.");
+            }
+            catch (Exception ex)
+            {
+                ShowError("Backing Up Character Saves", ex);
+            }
+        }
+
+        private void OnManageSavesClicked(object sender, EventArgs e)
+        {
+            string charactersLiveDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"MotorTown\Saved\SaveGames\Characters");
+            
+            if (!Directory.Exists(saveGameBackupDir) || Directory.GetFiles(saveGameBackupDir, "*.sav").Length == 0)
+            {
+                MessageBox.Show("No saved character backups found in 'ServerMods\\Backup_Saves'. Please run 'Backup Character Saves' first.", "No Saves Backed Up", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            Form manageForm = new Form
+            {
+                Text = "Manage / Restore Character Saves",
+                Width = 480,
+                Height = 460,
+                StartPosition = FormStartPosition.CenterParent,
+                MinimizeBox = false,
+                MaximizeBox = false
+            };
+
+            Label lblInfo = new Label
+            {
+                Text = "Select character saves to restore to game\nor delete from backup storage:",
+                Location = new Point(15, 15),
+                AutoSize = false,
+                Size = new Size(435, 40),
+                Font = new Font(FontFamily.GenericSansSerif, 9, FontStyle.Bold),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+
+            CheckedListBox chkListSaves = new CheckedListBox
+            {
+                Location = new Point(15, 60),
+                Size = new Size(435, 285),
+                CheckOnClick = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+            };
+
+            foreach (string file in Directory.GetFiles(saveGameBackupDir, "*.sav"))
+            {
+                string fileName = Path.GetFileName(file);
+                chkListSaves.Items.Add(fileName, true);
+            }
+
+            Button btnRestoreSelected = new ShinyButton
+            {
+                Text = "Restore Selected Saves",
+                Location = new Point(15, 355),
+                Width = 215,
+                Height = 38,
+                FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+                Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold)
+            };
+
+            Button btnDeleteSelectedSaves = new ShinyButton
+            {
+                Text = "Delete Selected Saves",
+                Location = new Point(238, 355),
+                Width = 215,
+                Height = 38,
+                FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                Font = new Font(FontFamily.GenericSansSerif, 8.5f, FontStyle.Bold)
+            };
+
+            btnRestoreSelected.Click += delegate
+            {
+                if (chkListSaves.CheckedItems.Count == 0)
+                {
+                    MessageBox.Show("Please check at least one save file to restore.", "Notice");
+                    return;
+                }
+
+                if (!Directory.Exists(charactersLiveDir))
+                {
+                    try { Directory.CreateDirectory(charactersLiveDir); }
+                    catch (Exception ex)
+                    {
+                        ShowError("Creating Live Characters Directory", ex);
+                        return;
+                    }
+                }
+
+                if (MessageBox.Show("Are you sure you want to restore the selected character save(s) to your active game files?", "Confirm Restore", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                    return;
+
+                try
+                {
+                    int restored = 0;
+                    foreach (var item in chkListSaves.CheckedItems)
+                    {
+                        string fileName = item.ToString();
+                        string src = Path.Combine(saveGameBackupDir, fileName);
+                        string dest = Path.Combine(charactersLiveDir, fileName);
+                        File.Copy(src, dest, true);
+                        restored++;
+                    }
+
+                    MessageBox.Show("Successfully restored " + restored + " character save file(s) to the game directory.", "Restore Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Restoring Character Saves", ex);
+                }
+            };
+
+            btnDeleteSelectedSaves.Click += delegate
+            {
+                if (chkListSaves.CheckedItems.Count == 0)
+                {
+                    MessageBox.Show("Please check at least one save file to delete.", "Notice");
+                    return;
+                }
+
+                string confirmationInput = Interaction.InputBox("To permanently delete the selected save backup(s), type 'delete' below:", "Confirm Deletion", "");
+                if (!confirmationInput.Trim().Equals("delete", StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show("Deletion cancelled. You must type 'delete' correctly to confirm.", "Cancelled", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                try
+                {
+                    int deleted = 0;
+                    List<object> itemsToRemove = new List<object>();
+                    foreach (var item in chkListSaves.CheckedItems)
+                    {
+                        string fileName = item.ToString();
+                        string targetPath = Path.Combine(saveGameBackupDir, fileName);
+                        if (File.Exists(targetPath))
+                        {
+                            File.Delete(targetPath);
+                            deleted++;
+                            itemsToRemove.Add(item);
+                        }
+                    }
+
+                    foreach (var item in itemsToRemove)
+                    {
+                        chkListSaves.Items.Remove(item);
+                    }
+
+                    MessageBox.Show("Successfully deleted " + deleted + " save backup file(s).", "Deleted", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError("Deleting Character Saves", ex);
+                }
+            };
+
+            manageForm.Controls.Add(lblInfo);
+            manageForm.Controls.Add(chkListSaves);
+            manageForm.Controls.Add(btnRestoreSelected);
+            manageForm.Controls.Add(btnDeleteSelectedSaves);
+
+            ApplyDialogTheme(manageForm);
+            manageForm.ShowDialog(this);
+        }
+
+        private void OnLaunchGameClicked(object sender, EventArgs e)
+        {
+            try
+            {
+                Process.Start("steam://rungameid/1369670");
+            }
+            catch (Exception ex)
+            {
+                ShowError("Launch Motor Town via Steam", ex);
+            }
+        }
+    }
+
+    // Custom-drawn button with a glossy, slightly 3D look: a top-to-bottom gradient body,
+    // a soft highlight band near the top to fake a glass/shine reflection, a subtle border,
+    // and distinct hover/pressed states. FlatStyle is forced to Flat with no built-in border
+    // so this OnPaint override is the only thing responsible for drawing the button.
+    // Plain Panel is not double-buffered by default, so repeatedly invalidating one for a
+    // custom-painted animation (like the busy spinner) visibly flickers. DoubleBuffered is
+    // only protected on Control, so it can only be set from inside a class that inherits
+    // from it - hence this tiny subclass instead of setting it from the Form.
+    public class DoubleBufferedPanel : Panel
+    {
+        public DoubleBufferedPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+    }
+
+    public class ShinyButton : Button
+    {
+        private bool isHovering = false;
+        private bool isPressed = false;
+
+        public ShinyButton()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            isHovering = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            isHovering = false;
+            isPressed = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs mevent)
+        {
+            base.OnMouseDown(mevent);
+            isPressed = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs mevent)
+        {
+            base.OnMouseUp(mevent);
+            isPressed = false;
+            Invalidate();
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs pevent)
+        {
+            // Intentionally does nothing: OnPaint below fills the button's entire
+            // rectangular bounds itself on every repaint, so there's no separate
+            // "background" layer left to paint here. Painting one anyway (even matching
+            // colors) risks a visible seam where the two paint passes meet if the button is
+            // resized or DPI-scaled between them - the previous corner-color-mismatch bug
+            // came from exactly that kind of two-layer approach.
+        }
+
+        protected override void OnPaint(PaintEventArgs pevent)
+        {
+            Graphics g = pevent.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighSpeed;
+
+            Rectangle bounds = new Rectangle(0, 0, Width, Height);
+
+            Color baseColor = Enabled ? BackColor : Color.FromArgb(90, 90, 90);
+            Color topColor = Lighten(baseColor, isPressed ? -6 : (isHovering ? 28 : 16));
+            Color bottomColor = Darken(baseColor, isPressed ? 16 : 4);
+
+            // One continuous gradient across the full rectangle - a few extra blend stops
+            // give it a soft glossy look without a second overlay shape, which is what
+            // previously produced a visible horizontal seam where the overlay's edge met
+            // the body fill underneath it.
+            using (System.Drawing.Drawing2D.LinearGradientBrush bodyBrush =
+                new System.Drawing.Drawing2D.LinearGradientBrush(new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height) + 1), topColor, bottomColor, System.Drawing.Drawing2D.LinearGradientMode.Vertical))
+            {
+                System.Drawing.Drawing2D.ColorBlend blend = new System.Drawing.Drawing2D.ColorBlend(4);
+                blend.Colors = new Color[] { topColor, Lighten(topColor, isPressed ? 0 : 10), baseColor, bottomColor };
+                blend.Positions = new float[] { 0f, 0.18f, 0.55f, 1f };
+                bodyBrush.InterpolationColors = blend;
+
+                g.FillRectangle(bodyBrush, bounds);
+            }
+
+            using (Pen borderPen = new Pen(Darken(baseColor, 45), 1f))
+            {
+                g.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+            }
+
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+            TextRenderer.DrawText(g, Text, Font, bounds, ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+
+            if (Focused && ShowFocusCues)
+            {
+                Rectangle focusRect = Rectangle.Inflate(bounds, -4, -4);
+                using (Pen focusPen = new Pen(Color.FromArgb(140, 255, 255, 255)) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot })
+                {
+                    g.DrawRectangle(focusPen, focusRect);
+                }
+            }
+        }
+
+        private static Color Lighten(Color c, int amount)
+        {
+            return Color.FromArgb(c.A, Clamp(c.R + amount), Clamp(c.G + amount), Clamp(c.B + amount));
+        }
+
+        private static Color Darken(Color c, int amount)
+        {
+            return Color.FromArgb(c.A, Clamp(c.R - amount), Clamp(c.G - amount), Clamp(c.B - amount));
+        }
+
+        private static int Clamp(int v)
+        {
+            return v < 0 ? 0 : (v > 255 ? 255 : v);
+        }
+    }
+}
+"@
+
+$cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+if (-not (Test-Path "ModManagerIcon.ico")) {
+    Write-Host "ModManagerIcon.ico not found next to this script - compiling without a custom icon." -ForegroundColor Yellow
+    & $cscPath /target:winexe /out:ModManager.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:Microsoft.VisualBasic.dll ModManager.cs
+} else {
+    & $cscPath /target:winexe /out:ModManager.exe /win32icon:ModManagerIcon.ico /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:Microsoft.VisualBasic.dll ModManager.cs
+}
+
+if ($?) {
+    Write-Host "Compilation successful! Starting ModManager.exe..." -ForegroundColor Green
+    Start-Process "ModManager.exe"
+}
