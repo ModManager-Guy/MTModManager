@@ -1,3 +1,51 @@
 0.4
 
-hi whats up i added something
+===============================================================================
+                       MOTOR TOWN MOD MANAGER - CHANGELOG
+===============================================================================
+
+[WHAT'S NEW]
+-------------------------------------------------------------------------------
+CONSOLE MODE (NEW: CONTROLLER / STEAM DECK SUPPORT)
+  • Entirely new Console Mode featuring a big-tile, category-based layout 
+    (Mods / Servers / Backups / Utility) built for controller navigation.
+  • Full Xbox-compatible (XInput) controller navigation with D-pad, left-stick, 
+    and A/B/Y actions, featuring edge-detection and hold-to-repeat inputs.
+  • Themed full-screen picker windows replacing native dropdowns for Theme, 
+    Target Server, Mod Search, and Game Paks Directory with search filters.
+  • Controller-accessible Console Mode Settings menu (Desktop mode toggle, 
+    on-screen keyboard toggle, and Colorblind Options).
+  • Dedicated D-pad navigation zones with visual focus rings for sidebar categories, 
+    top-bar fields, and a "Resize Mod List" focus stop.
+  • Reworked full-width top-row layout specifically tailored for Console Mode.
+
+ON-SCREEN VIRTUAL KEYBOARD (NEW)
+  • Integrated themed on-screen keyboard for controller-only text input.
+  • Automatically summons when focusing text fields in Console Mode.
+  • Includes D-pad navigation, key repeat, backspace, and a Close button.
+
+UNDO / REDO SYSTEM (NEW)
+  • Dedicated Undo/Redo stack for destructive actions (deleted server folders 
+    and mod files).
+  • Live action count indicator displayed on the corner Undo icon.
+
+COLORBLIND ACCESSIBILITY (NEW)
+  • Colorblind modes (Off / Protanopia / Deuteranopia / Tritanopia).
+  • Remaps semantic UI colors (Delete, Add/Launch, Undo, and accents) for optimal 
+    visibility, configurable from Desktop and Console settings.
+
+AUTO-UPDATE CHECKER (NEW)
+  • Background version checking with changelog dialogs and Update / Skip flows.
+  • Animated corner badge notification when a new update is detected.
+
+CORNER ICON ROW (NEW)
+  • Unified corner icon group featuring matching hand-drawn vector glyphs 
+    (ConsoleIcons set).
+  • Dynamic auto-sliding layout housing Settings, Redo, Undo, Discord, and 
+    Update icons.
+
+THEMED DIALOGS (NEW)
+  • Replaced standard Windows MessageBox/InputBox popups with custom themed 
+    confirmation, input, and dropdown dialogs matching the active app theme.
+
+===============================================================================
